@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-swift format lint --recursive Sources Checks Scripts/generate_icon.swift
+swift format lint --recursive Sources Checks Scripts Package.swift
 swift build
 swiftc \
   Sources/Downmix/Models/BedLayout.swift \

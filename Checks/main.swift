@@ -24,6 +24,23 @@ require(parsed.bands[1].kind == .lowShelf, "low shelf")
 require(parsed.bands[2].kind == .highShelf, "high shelf")
 require(parsed.bands[2].channel == .left, "channel section")
 
+let serializedPEQ = PEQParser.serialize(parsed)
+let reparsedPEQ = PEQParser.parse(serializedPEQ)
+require(reparsedPEQ == parsed, "PEQ structured serialization round-trip")
+require(serializedPEQ.contains("Channel: L"), "PEQ channel serialization")
+
+let channelReset = PEQParser.parse(
+  """
+  Channel: L
+  Filter: ON PK Fc 500 Hz Gain -2 dB Q 1
+  Channel: ALL
+  Filter: ON PK Fc 2000 Hz Gain 1 dB Q 0.8
+  """
+)
+require(channelReset.bands.count == 2, "PEQ channel reset filter count")
+require(channelReset.bands[0].channel == .left, "PEQ left channel")
+require(channelReset.bands[1].channel == .all, "PEQ all-channel reset")
+
 var processor = DownmixProcessor()
 var silence = [Float](repeating: 0, count: 16 * 256)
 var output = [Float](repeating: 1, count: 2 * 256)

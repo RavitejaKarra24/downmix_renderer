@@ -8,16 +8,16 @@ struct DownmixApp: App {
     Window("Downmix", id: "main") {
       ContentView()
         .environment(appState)
-        .frame(minWidth: 820, minHeight: 640)
+        .frame(minWidth: 900, minHeight: 680)
     }
-    .defaultSize(width: 920, height: 720)
+    .defaultSize(width: 1_040, height: 760)
     .commands {
       CommandGroup(replacing: .newItem) {}
       CommandMenu("Transport") {
         Button(appState.isRunning ? "Stop" : "Start") {
           appState.toggle()
         }
-        .keyboardShortcut(.space, modifiers: [])
+        .keyboardShortcut(.space, modifiers: [.command, .shift])
       }
     }
 
@@ -26,11 +26,12 @@ struct DownmixApp: App {
         .environment(appState)
     }
 
-    MenuBarExtra(
-      "Downmix", systemImage: appState.isRunning ? "waveform.circle.fill" : "waveform.circle"
-    ) {
+    MenuBarExtra {
       MenuBarView()
         .environment(appState)
+    } label: {
+      MenuBarStatusIcon(source: appState.meterSource, isRunning: appState.isRunning)
     }
+    .menuBarExtraStyle(.window)
   }
 }

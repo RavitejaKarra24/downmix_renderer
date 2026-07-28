@@ -12,5 +12,5 @@ for spec in "16 icon_16x16.png" "32 icon_16x16@2x.png" "32 icon_32x32.png" "64 i
   sips -z "$1" "$1" /tmp/downmix-icon-1024.png --out "/tmp/Downmix.iconset/$2" >/dev/null
  done
 
-iconutil -c icns /tmp/Downmix.iconset -o Icon.icns
+swift Scripts/pack_icns.swift /tmp/Downmix.iconset Icon.icns
 echo "Wrote $ROOT/Icon.icns"

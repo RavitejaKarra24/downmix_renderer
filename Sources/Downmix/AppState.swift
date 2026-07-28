@@ -56,6 +56,7 @@ final class AppState {
 
   private let engine = AudioEngine()
   private var deviceListenerInstalled = false
+  private var didHandleAutomaticStart = false
 
   init() {
     preferences = .load()
@@ -143,6 +144,13 @@ final class AppState {
     } else {
       start()
     }
+  }
+
+  func startAutomaticallyIfNeeded() {
+    guard !didHandleAutomaticStart else { return }
+    didHandleAutomaticStart = true
+    guard preferences.autoStart, !isRunning else { return }
+    start()
   }
 
   func start() {

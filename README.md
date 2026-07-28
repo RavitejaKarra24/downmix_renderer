@@ -7,7 +7,9 @@ A clean-room rebuild of [peqdb/macos Downmix Renderer](https://github.com/peqdb/
 - **SwiftUI** interface (no Python, no WebKit, no localhost server)
 - **Core Audio** dual-device engine
 - ADC2-direct bed matrix + Butterworth LFE path
-- Equalizer APO-style global + speaker PEQ
+- Structured global + speaker PEQ with a live response preview and raw Equalizer APO import
+- Ballistic 9.1.6 activity meters with peak hold and stereo dBFS grid
+- Adaptive Light/Dark appearance, native materials, and an inline menu-bar meter
 - Low idle CPU (audio runs only when started)
 
 ## Requirements
@@ -37,7 +39,11 @@ open Downmix.app
 2. Select **BlackHole 16ch** as input and your stereo DAC/headphones as output.
 3. Adjust preamp (default **-9.5 dB**).
 4. Press **Start**.
-5. Optionally open **EQ / Profiles** for User PEQ and Speaker EQ.
+5. Optionally open **EQ / Profiles** to edit filters visually, inspect the response curve,
+   manage profiles, or import raw Equalizer APO text.
+
+Device cards can be filtered when the list is long. Pin devices from their context menu,
+then drag pinned devices into the order you use most.
 
 ## DSP notes
 

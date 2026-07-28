@@ -15,8 +15,8 @@ context.setShouldAntialias(true)
 let tile = NSBezierPath(
   roundedRect: NSRect(x: 64, y: 64, width: 896, height: 896), xRadius: 210, yRadius: 210)
 let gradient = NSGradient(colors: [
-  NSColor(red: 0.035, green: 0.045, blue: 0.065, alpha: 1),
-  NSColor(red: 0.075, green: 0.10, blue: 0.15, alpha: 1),
+  NSColor(red: 0.045, green: 0.052, blue: 0.066, alpha: 1),
+  NSColor(red: 0.055, green: 0.19, blue: 0.19, alpha: 1),
 ])!
 gradient.draw(in: tile, angle: -45)
 
@@ -44,15 +44,16 @@ for (index, point) in channelPoints.enumerated() {
   let controlA = NSPoint(x: point.x + (target.x - point.x) * 0.32, y: point.y - 70)
   let controlB = NSPoint(x: target.x, y: target.y + 110)
   path.curve(to: target, controlPoint1: controlA, controlPoint2: controlB)
-  NSColor(red: 0.35, green: 0.68, blue: 1.0, alpha: index < 5 ? 0.48 : 0.72).setStroke()
+  NSColor(red: 0.18, green: 0.78, blue: 0.71, alpha: index < 5 ? 0.48 : 0.72)
+    .setStroke()
   path.lineWidth = index < 5 ? 8 : 10
   path.lineCapStyle = .round
   path.stroke()
 
   let dotColor =
     index < 5
-    ? NSColor(red: 0.72, green: 0.55, blue: 1.0, alpha: 1)
-    : NSColor(red: 0.40, green: 0.76, blue: 1.0, alpha: 1)
+    ? NSColor(red: 0.70, green: 0.55, blue: 0.98, alpha: 1)
+    : NSColor(red: 0.31, green: 0.67, blue: 0.98, alpha: 1)
   dotColor.setFill()
   NSBezierPath(ovalIn: NSRect(x: point.x - 13, y: point.y - 13, width: 26, height: 26)).fill()
 }
@@ -60,7 +61,7 @@ for (index, point) in channelPoints.enumerated() {
 for (x, label) in [(438.0, "L"), (586.0, "R")] {
   let bar = NSBezierPath(
     roundedRect: NSRect(x: x - 45, y: 235, width: 90, height: 180), xRadius: 45, yRadius: 45)
-  NSColor(red: 0.36, green: 0.70, blue: 1.0, alpha: 1).setFill()
+  NSColor(red: 0.18, green: 0.78, blue: 0.71, alpha: 1).setFill()
   bar.fill()
 
   let attributes: [NSAttributedString.Key: Any] = [
