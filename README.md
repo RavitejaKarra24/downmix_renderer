@@ -1,13 +1,12 @@
 # Downmix
 
-Native macOS **9.1.6 → stereo** downmixer and parametric EQ.
+Native macOS **9.1.6 → stereo** downmixer.
 
 A clean-room rebuild of [peqdb/macos Downmix Renderer](https://github.com/peqdb/macos) with:
 
 - **SwiftUI** interface (no Python, no WebKit, no localhost server)
 - **Core Audio** dual-device engine
 - ADC2-direct bed matrix + Butterworth LFE path
-- Structured global + speaker PEQ with a live response preview and raw Equalizer APO import
 - Ballistic 9.1.6 activity meters with peak hold and stereo dBFS grid
 - Adaptive Light/Dark appearance, native materials, and an inline menu-bar meter
 - Low idle CPU (audio runs only when started)
@@ -18,7 +17,18 @@ A clean-room rebuild of [peqdb/macos Downmix Renderer](https://github.com/peqdb/
 - [BlackHole 16ch](https://existential.audio/blackhole/)
 - In **Audio MIDI Setup**, configure BlackHole 16ch as **9.1.6** with channels 1–16
 
-## Build & run
+## Install
+
+Build from source, install to `~/Applications`, and launch:
+
+```bash
+./install.sh
+```
+
+Set `OPEN_APP=0` to install without launching, or override the destination with
+`INSTALL_DIR=/path/to/apps`.
+
+## Build & run locally
 
 ```bash
 # package ad-hoc signed .app and launch
@@ -39,8 +49,11 @@ open Downmix.app
 2. Select **BlackHole 16ch** as input and your stereo DAC/headphones as output.
 3. Adjust preamp (default **-9.5 dB**).
 4. Press **Start**.
-5. Optionally open **EQ / Profiles** to edit filters visually, inspect the response curve,
-   manage profiles, or import raw Equalizer APO text.
+
+To add equalization, run **EQ for Mac** after Downmix. Keep BlackHole as the macOS default,
+select a physical stereo output in Downmix, then toggle EQ for Mac on. EQ for Mac
+uses a device-scoped tap on Downmix’s saved physical output, so it no longer mutes
+or collapses the 16-channel BlackHole feed.
 
 Device cards can be filtered when the list is long. Pin devices from their context menu,
 then drag pinned devices into the order you use most.
@@ -52,7 +65,7 @@ then drag pinned devices into the order you use most.
 - Center: `-3 dB` to both sides (`0.7071`)
 - Surround/height: hard-panned L/R
 - LFE: fixed ADC2 coefficient `2.26464431`, optional 125 Hz 4th-order Butterworth + 172-sample dry delay
-- EQ order: matrix + master preamp → global PEQ → L/R swap → speaker EQ
+- Output order: matrix + master preamp → optional L/R swap
 
 ## Efficiency vs original
 

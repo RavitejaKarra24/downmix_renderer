@@ -1,13 +1,5 @@
 import Foundation
 
-struct EQProfile: Identifiable, Codable, Hashable, Sendable {
-  var id: UUID = UUID()
-  var name: String
-  var swapOutputs: Bool
-  var globalPEQText: String
-  var speakerPEQText: String
-}
-
 struct AppPreferences: Codable, Equatable, Sendable {
   var inputDeviceUID: String = ""
   var outputDeviceUID: String = ""
@@ -21,10 +13,6 @@ struct AppPreferences: Codable, Equatable, Sendable {
   var keepOutputAlive: Bool = false
   var lfeLowpass: Bool = true
   var swapOutputs: Bool = false
-  var globalPEQText: String = ""
-  var speakerPEQText: String = ""
-  var eqProfiles: [EQProfile] = []
-  var activeEQProfileID: UUID?
   var autoStart: Bool = false
 
   static let storageURL: URL = {

@@ -13,8 +13,6 @@ struct DownmixProcessor: Sendable {
     var preampDb: Double = -9.5
     var lfeLowpass: Bool = true
     var swapOutputs: Bool = false
-    var globalPEQText: String = ""
-    var speakerPEQText: String = ""
     var inputChannelCount: Int = 16
   }
 
@@ -25,14 +23,6 @@ struct DownmixProcessor: Sendable {
   private var dryDelayIndex = 0
   private var stereoDelayL: [Double]
   private var stereoDelayR: [Double]
-
-  private var globalLeft: [BiquadFilter] = []
-  private var globalRight: [BiquadFilter] = []
-  private var speakerLeft: [BiquadFilter] = []
-  private var speakerRight: [BiquadFilter] = []
-  private var globalPreamp = 1.0
-  private var speakerPreampLeft = 1.0
-  private var speakerPreampRight = 1.0
 
   private var inputPeaks = [Float](repeating: 0, count: 16)
   private var outputPeakL: Float = 0
@@ -50,7 +40,6 @@ struct DownmixProcessor: Sendable {
     self.configuration = configuration
     masterGain = pow(10.0, configuration.preampDb / 20.0)
     rebuildLFE()
-    rebuildEQ()
     stereoDelayL = [Double](repeating: 0, count: Self.butterworthDryDelaySamples)
     stereoDelayR = [Double](repeating: 0, count: Self.butterworthDryDelaySamples)
     dryDelayIndex = 0
@@ -161,21 +150,11 @@ struct DownmixProcessor: Sendable {
       left *= masterGain
       right *= masterGain
 
-      left *= globalPreamp
-      right *= globalPreamp
-      for i in globalLeft.indices { left = globalLeft[i].process(left) }
-      for i in globalRight.indices { right = globalRight[i].process(right) }
-
       if swap {
         let tmp = left
         left = right
         right = tmp
       }
-
-      left *= speakerPreampLeft
-      right *= speakerPreampRight
-      for i in speakerLeft.indices { left = speakerLeft[i].process(left) }
-      for i in speakerRight.indices { right = speakerRight[i].process(right) }
 
       if left > 1 {
         left = 1
@@ -234,76 +213,6 @@ struct DownmixProcessor: Sendable {
     lfeFilterB.coefficients = BiquadDesign.lowPass(freq: f, q: 1.3065629648763766, sampleRate: sr)
     lfeFilterA.reset()
     lfeFilterB.reset()
-  }
-
-  private mutating func rebuildEQ() {
-    let sr = Self.sampleRate
-    let global = PEQParser.parse(configuration.globalPEQText)
-    let speaker = PEQParser.parse(configuration.speakerPEQText)
-
-    globalPreamp = pow(10.0, global.preampDb / 20.0)
-    speakerPreampLeft = pow(10.0, speaker.preampDb / 20.0)
-    speakerPreampRight = pow(10.0, speaker.preampDb / 20.0)
-
-    globalLeft = makeFilters(bands: global.bands, side: .left, sampleRate: sr)
-    globalRight = makeFilters(bands: global.bands, side: .right, sampleRate: sr)
-
-    // Match original launcher: with swap on, CH1 feeds physical left and CH0 feeds physical right.
-    if configuration.swapOutputs {
-      speakerLeft = makeFilters(bands: speaker.bands, side: .right, sampleRate: sr)
-      speakerRight = makeFilters(bands: speaker.bands, side: .left, sampleRate: sr)
-    } else {
-      speakerLeft = makeFilters(bands: speaker.bands, side: .left, sampleRate: sr)
-      speakerRight = makeFilters(bands: speaker.bands, side: .right, sampleRate: sr)
-    }
-  }
-
-  private enum Side { case left, right }
-
-  private func makeFilters(bands: [PEQBand], side: Side, sampleRate: Double) -> [BiquadFilter] {
-    var filters: [BiquadFilter] = []
-    for band in bands {
-      switch band.channel {
-      case .all:
-        break
-      case .left:
-        if side != .left { continue }
-      case .right:
-        if side != .right { continue }
-      case .index(let index):
-        if side == .left && index != 0 { continue }
-        if side == .right && index != 1 { continue }
-      }
-
-      var filter = BiquadFilter()
-      switch band.kind {
-      case .peaking:
-        filter.coefficients = BiquadDesign.peaking(
-          freq: band.frequency,
-          q: band.q,
-          gainDb: band.gainDb,
-          sampleRate: sampleRate
-        )
-      case .lowShelf:
-        filter.coefficients = BiquadDesign.lowShelf(
-          freq: band.frequency,
-          q: band.q,
-          gainDb: band.gainDb,
-          sampleRate: sampleRate
-        )
-      case .highShelf:
-        filter.coefficients = BiquadDesign.highShelf(
-          freq: band.frequency,
-          q: band.q,
-          gainDb: band.gainDb,
-          sampleRate: sampleRate
-        )
-      case .off:
-        continue
-      }
-      filters.append(filter)
-    }
-    return filters
   }
 
   private static func db(fromLinear value: Float) -> Float {

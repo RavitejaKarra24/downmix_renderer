@@ -29,11 +29,6 @@ struct ContentView: View {
     .task {
       state.startAutomaticallyIfNeeded()
     }
-    .sheet(isPresented: $state.showEQSheet) {
-      EQEditorView()
-        .environment(state)
-        .frame(minWidth: 820, minHeight: 600)
-    }
   }
 
   private var header: some View {
@@ -195,22 +190,13 @@ struct ContentView: View {
 
       dspOptions
 
-      HStack(spacing: 10) {
-        Button {
-          state.showEQSheet = true
-        } label: {
-          Label("EQ / Profiles", systemImage: "waveform.badge.magnifyingglass")
-        }
-        .buttonStyle(SecondaryButtonStyle())
-
-        Button {
-          state.refreshDevices()
-        } label: {
-          Label("Refresh", systemImage: "arrow.clockwise")
-        }
-        .buttonStyle(SecondaryButtonStyle())
-        .help("Rescan Core Audio devices")
+      Button {
+        state.refreshDevices()
+      } label: {
+        Label("Refresh", systemImage: "arrow.clockwise")
       }
+      .buttonStyle(SecondaryButtonStyle())
+      .help("Rescan Core Audio devices")
 
       advancedControls
     }
@@ -227,7 +213,7 @@ struct ContentView: View {
           Text("Preamp")
             .font(DownmixTheme.TypeScale.bodyStrong)
             .foregroundStyle(DownmixTheme.textPrimary)
-          Text("Headroom before EQ and matrix processing")
+          Text("Headroom before matrix processing")
             .font(DownmixTheme.TypeScale.caption)
             .foregroundStyle(DownmixTheme.textSecondary)
         }
@@ -272,7 +258,7 @@ struct ContentView: View {
       Toggle(isOn: $state.preferences.swapOutputs) {
         optionLabel(
           title: "Swap L/R outputs",
-          detail: "Applied before physical speaker EQ",
+          detail: "Swaps the physical stereo outputs",
           symbol: "arrow.left.arrow.right"
         )
       }

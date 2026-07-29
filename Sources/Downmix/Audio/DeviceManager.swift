@@ -20,6 +20,15 @@ enum DeviceManager {
     allDevices().first { $0.uid == uid }
   }
 
+  static func isSafeOutputRoute(_ device: AudioDeviceInfo, inputUID: String) -> Bool {
+    !routeContainsDevice(
+      deviceID: device.id,
+      matchingUID: inputUID,
+      rejectsBlackHole: true,
+      visited: []
+    )
+  }
+
   static func preferredInput(matchingName name: String?, uid: String?) -> AudioDeviceInfo? {
     let devices = inputDevices()
     if let uid, let match = devices.first(where: { $0.uid == uid }) { return match }
@@ -91,6 +100,63 @@ enum DeviceManager {
       outputChannelCount: outputs,
       nominalSampleRate: rate
     )
+  }
+
+  private static func routeContainsDevice(
+    deviceID: AudioDeviceID,
+    matchingUID inputUID: String,
+    rejectsBlackHole: Bool,
+    visited: Set<AudioDeviceID>
+  ) -> Bool {
+    guard !visited.contains(deviceID) else { return false }
+    var visited = visited
+    visited.insert(deviceID)
+
+    let uid = stringProperty(id: deviceID, selector: kAudioDevicePropertyDeviceUID) ?? ""
+    let name = stringProperty(id: deviceID, selector: kAudioObjectPropertyName) ?? ""
+    if uid == inputUID
+      || (rejectsBlackHole
+        && (uid.localizedCaseInsensitiveContains("blackhole")
+          || name.localizedCaseInsensitiveContains("blackhole")))
+    {
+      return true
+    }
+
+    var property = AudioObjectPropertyAddress(
+      mSelector: kAudioAggregateDevicePropertyActiveSubDeviceList,
+      mScope: kAudioObjectPropertyScopeGlobal,
+      mElement: kAudioObjectPropertyElementMain
+    )
+    guard AudioObjectHasProperty(deviceID, &property) else { return false }
+
+    var dataSize: UInt32 = 0
+    guard AudioObjectGetPropertyDataSize(deviceID, &property, 0, nil, &dataSize) == noErr,
+      dataSize > 0
+    else {
+      return false
+    }
+    let count = Int(dataSize) / MemoryLayout<AudioDeviceID>.size
+    var subdeviceIDs = [AudioDeviceID](repeating: 0, count: count)
+    guard
+      AudioObjectGetPropertyData(
+        deviceID,
+        &property,
+        0,
+        nil,
+        &dataSize,
+        &subdeviceIDs
+      ) == noErr
+    else {
+      return false
+    }
+    return subdeviceIDs.contains {
+      routeContainsDevice(
+        deviceID: $0,
+        matchingUID: inputUID,
+        rejectsBlackHole: rejectsBlackHole,
+        visited: visited
+      )
+    }
   }
 
   private static func stringProperty(id: AudioDeviceID, selector: AudioObjectPropertySelector)

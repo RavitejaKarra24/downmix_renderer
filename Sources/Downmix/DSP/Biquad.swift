@@ -30,61 +30,6 @@ struct BiquadFilter: Sendable {
 }
 
 enum BiquadDesign {
-  static func peaking(freq: Double, q: Double, gainDb: Double, sampleRate: Double)
-    -> BiquadCoefficients
-  {
-    let a = pow(10.0, gainDb / 40.0)
-    let w0 = 2.0 * .pi * freq / sampleRate
-    let alpha = sin(w0) / (2.0 * max(q, 0.05))
-    let cosw = cos(w0)
-
-    let b0 = 1 + alpha * a
-    let b1 = -2 * cosw
-    let b2 = 1 - alpha * a
-    let a0 = 1 + alpha / a
-    let a1 = -2 * cosw
-    let a2 = 1 - alpha / a
-    return normalize(b0: b0, b1: b1, b2: b2, a0: a0, a1: a1, a2: a2)
-  }
-
-  static func lowShelf(freq: Double, q: Double, gainDb: Double, sampleRate: Double)
-    -> BiquadCoefficients
-  {
-    let a = pow(10.0, gainDb / 40.0)
-    let w0 = 2.0 * .pi * freq / sampleRate
-    let cosw = cos(w0)
-    let sinw = sin(w0)
-    let alpha = sinw / (2.0 * max(q, 0.05))
-    let twoSqrtAAlpha = 2 * sqrt(a) * alpha
-
-    let b0 = a * ((a + 1) - (a - 1) * cosw + twoSqrtAAlpha)
-    let b1 = 2 * a * ((a - 1) - (a + 1) * cosw)
-    let b2 = a * ((a + 1) - (a - 1) * cosw - twoSqrtAAlpha)
-    let a0 = (a + 1) + (a - 1) * cosw + twoSqrtAAlpha
-    let a1 = -2 * ((a - 1) + (a + 1) * cosw)
-    let a2 = (a + 1) + (a - 1) * cosw - twoSqrtAAlpha
-    return normalize(b0: b0, b1: b1, b2: b2, a0: a0, a1: a1, a2: a2)
-  }
-
-  static func highShelf(freq: Double, q: Double, gainDb: Double, sampleRate: Double)
-    -> BiquadCoefficients
-  {
-    let a = pow(10.0, gainDb / 40.0)
-    let w0 = 2.0 * .pi * freq / sampleRate
-    let cosw = cos(w0)
-    let sinw = sin(w0)
-    let alpha = sinw / (2.0 * max(q, 0.05))
-    let twoSqrtAAlpha = 2 * sqrt(a) * alpha
-
-    let b0 = a * ((a + 1) + (a - 1) * cosw + twoSqrtAAlpha)
-    let b1 = -2 * a * ((a - 1) + (a + 1) * cosw)
-    let b2 = a * ((a + 1) + (a - 1) * cosw - twoSqrtAAlpha)
-    let a0 = (a + 1) - (a - 1) * cosw + twoSqrtAAlpha
-    let a1 = 2 * ((a - 1) - (a + 1) * cosw)
-    let a2 = (a + 1) - (a - 1) * cosw - twoSqrtAAlpha
-    return normalize(b0: b0, b1: b1, b2: b2, a0: a0, a1: a1, a2: a2)
-  }
-
   /// Butterworth low-pass cascade section helper (RBJ cookbook style with Q).
   static func lowPass(freq: Double, q: Double, sampleRate: Double) -> BiquadCoefficients {
     let w0 = 2.0 * .pi * freq / sampleRate

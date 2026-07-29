@@ -33,6 +33,7 @@ final class AudioEngine: @unchecked Sendable {
   private var configuration = DownmixProcessor.Configuration()
   private var inputChannels = 16
   private var framesPerBuffer: UInt32 = 128
+  private var expectedOutputDeviceID = AudioDeviceID(kAudioObjectUnknown)
   private var isRunning = false
   private var keepAliveOnly = false
 
@@ -76,29 +77,36 @@ final class AudioEngine: @unchecked Sendable {
     let ringCapacity = Int(Self.targetSampleRate * 0.1) * 2
     ring = FloatRingBuffer(capacity: ringCapacity)
 
-    if !keepAliveOnly {
-      inputUnit = try makeHALUnit()
-      try configureInputUnit(inputUnit!, deviceID: inputDeviceID)
-    }
+    do {
+      if !keepAliveOnly {
+        inputUnit = try makeHALUnit()
+        try configureInputUnit(inputUnit!, deviceID: inputDeviceID)
+      }
 
-    outputUnit = try makeHALUnit()
-    try configureOutputUnit(outputUnit!, deviceID: outputDeviceID)
+      outputUnit = try makeHALUnit()
+      try configureOutputUnit(outputUnit!, deviceID: outputDeviceID)
+      expectedOutputDeviceID = outputDeviceID
+      try verifyOutputRoute()
 
-    if let inputUnit {
-      try startUnit(inputUnit)
-    }
-    try startUnit(outputUnit!)
+      if let inputUnit {
+        try startUnit(inputUnit)
+      }
+      try startUnit(outputUnit!)
 
-    stateLock.lock()
-    isRunning = true
-    stateLock.unlock()
+      stateLock.lock()
+      isRunning = true
+      stateLock.unlock()
 
-    publish(
-      phase: keepAliveOnly ? .keepAlive : .running,
-      message: keepAliveOnly ? "Output keep-alive running" : "Stereo renderer running"
-    )
-    if !keepAliveOnly {
-      startMeterTimer()
+      publish(
+        phase: keepAliveOnly ? .keepAlive : .running,
+        message: keepAliveOnly ? "Output keep-alive running" : "Stereo renderer running"
+      )
+      if !keepAliveOnly {
+        startMeterTimer()
+      }
+    } catch {
+      try? stopInternal(notify: false)
+      throw error
     }
   }
 
@@ -338,6 +346,7 @@ final class AudioEngine: @unchecked Sendable {
     let outUnit = outputUnit
     inputUnit = nil
     outputUnit = nil
+    expectedOutputDeviceID = AudioDeviceID(kAudioObjectUnknown)
     stateLock.unlock()
 
     if let inUnit {
@@ -364,6 +373,55 @@ final class AudioEngine: @unchecked Sendable {
   private func check(_ status: OSStatus, _ label: String) throws {
     guard status == noErr else {
       throw EngineError.setupFailed("\(label) failed (\(status))")
+    }
+  }
+
+  private func verifyOutputRoute() throws {
+    guard let outputUnit,
+      expectedOutputDeviceID != kAudioObjectUnknown
+    else {
+      throw EngineError.setupFailed("Output device is unavailable")
+    }
+
+    var aliveAddress = AudioObjectPropertyAddress(
+      mSelector: kAudioDevicePropertyDeviceIsAlive,
+      mScope: kAudioObjectPropertyScopeGlobal,
+      mElement: kAudioObjectPropertyElementMain
+    )
+    var isAlive: UInt32 = 0
+    var aliveSize = UInt32(MemoryLayout<UInt32>.size)
+    try check(
+      AudioObjectGetPropertyData(
+        expectedOutputDeviceID,
+        &aliveAddress,
+        0,
+        nil,
+        &aliveSize,
+        &isAlive
+      ),
+      "verify output availability"
+    )
+    guard isAlive != 0 else {
+      throw EngineError.setupFailed("The selected output disconnected. Downmix stopped safely.")
+    }
+
+    var currentDevice = AudioDeviceID(kAudioObjectUnknown)
+    var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+    try check(
+      AudioUnitGetProperty(
+        outputUnit,
+        kAudioOutputUnitProperty_CurrentDevice,
+        kAudioUnitScope_Global,
+        0,
+        &currentDevice,
+        &size
+      ),
+      "verify output device"
+    )
+    guard currentDevice == expectedOutputDeviceID else {
+      throw EngineError.setupFailed(
+        "The selected output disconnected. Downmix stopped instead of routing back into BlackHole."
+      )
     }
   }
 
@@ -470,6 +528,15 @@ final class AudioEngine: @unchecked Sendable {
     timer.schedule(deadline: .now() + 0.1, repeating: 0.1)
     timer.setEventHandler { [weak self] in
       guard let self else { return }
+      do {
+        try self.verifyOutputRoute()
+      } catch {
+        self.logger.error("Output route lost: \(error.localizedDescription)")
+        try? self.stopInternal(notify: false)
+        self.publish(phase: .error, message: error.localizedDescription, meters: .empty)
+        return
+      }
+
       self.stateLock.lock()
       guard self.isRunning else {
         self.stateLock.unlock()

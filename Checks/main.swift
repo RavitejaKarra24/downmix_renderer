@@ -7,40 +7,6 @@ func require(_ condition: @autoclosure () -> Bool, _ message: String) {
   }
 }
 
-let peqText = """
-  Preamp: -6.0 dB
-  Filter: ON PK Fc 100 Hz Gain -3.5 dB Q 1.2
-  Filter: ON LS Fc 80 Hz Gain 2 dB Q 0.7
-  Filter: OFF PK Fc 1000 Hz Gain 1 dB Q 1
-  Channel: L
-  Filter: ON HS Fc 8000 Hz Gain -1 dB Q 0.7
-  """
-let parsed = PEQParser.parse(peqText)
-require(parsed.preampDb == -6, "PEQ preamp")
-require(parsed.bands.count == 3, "PEQ active filter count")
-require(parsed.bands[0].kind == .peaking, "peaking filter")
-require(parsed.bands[0].frequency == 100, "peaking frequency")
-require(parsed.bands[1].kind == .lowShelf, "low shelf")
-require(parsed.bands[2].kind == .highShelf, "high shelf")
-require(parsed.bands[2].channel == .left, "channel section")
-
-let serializedPEQ = PEQParser.serialize(parsed)
-let reparsedPEQ = PEQParser.parse(serializedPEQ)
-require(reparsedPEQ == parsed, "PEQ structured serialization round-trip")
-require(serializedPEQ.contains("Channel: L"), "PEQ channel serialization")
-
-let channelReset = PEQParser.parse(
-  """
-  Channel: L
-  Filter: ON PK Fc 500 Hz Gain -2 dB Q 1
-  Channel: ALL
-  Filter: ON PK Fc 2000 Hz Gain 1 dB Q 0.8
-  """
-)
-require(channelReset.bands.count == 2, "PEQ channel reset filter count")
-require(channelReset.bands[0].channel == .left, "PEQ left channel")
-require(channelReset.bands[1].channel == .all, "PEQ all-channel reset")
-
 var processor = DownmixProcessor()
 var silence = [Float](repeating: 0, count: 16 * 256)
 var output = [Float](repeating: 1, count: 2 * 256)

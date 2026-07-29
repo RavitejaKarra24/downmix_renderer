@@ -51,7 +51,6 @@ final class AppState {
   var status = EngineStatus()
   let meterSource = MeterSource()
   var errorMessage: String?
-  var showEQSheet = false
   var showAdvanced = false
 
   private let engine = AudioEngine()
@@ -163,8 +162,21 @@ final class AppState {
       errorMessage = "Selected input is unavailable."
       return
     }
+    guard let output = outputDevices.first(where: { $0.id == outputID }) else {
+      errorMessage = "Selected output is unavailable. Reconnect it or choose another output."
+      return
+    }
     guard input.inputChannelCount >= 16 else {
       errorMessage = "Input must expose at least 16 channels (BlackHole 16ch configured as 9.1.6)."
+      return
+    }
+    guard output.outputChannelCount >= 2 else {
+      errorMessage = "Output must expose at least two channels for stereo rendering."
+      return
+    }
+    guard DeviceManager.isSafeOutputRoute(output, inputUID: input.uid) else {
+      errorMessage =
+        "Output cannot be BlackHole or an aggregate route that contains the Downmix input."
       return
     }
 
@@ -212,8 +224,6 @@ final class AppState {
     config.preampDb = preferences.preampDb
     config.lfeLowpass = preferences.lfeLowpass
     config.swapOutputs = preferences.swapOutputs
-    config.globalPEQText = preferences.globalPEQText
-    config.speakerPEQText = preferences.speakerPEQText
     config.inputChannelCount = inputChannels
     return config
   }
