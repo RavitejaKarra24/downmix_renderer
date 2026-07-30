@@ -1,5 +1,9 @@
+for_everyday_people.md
 .build/
 .swiftpm/
 Downmix.app/
 .DS_Store
 *.trace
+
+# Downmix.zip is the committed download artifact, not build output. Keep it tracked.
+!Downmix.zip

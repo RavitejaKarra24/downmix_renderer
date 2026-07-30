@@ -1,8 +1,147 @@
 # Downmix
 
-Native macOS **9.1.6 → stereo** downmixer.
+Downmix takes spatial 9.1.6 audio — the kind Apple Music and streaming apps send to a
+surround system — and folds it down to clean stereo for your headphones or speakers,
+in real time.
 
-A clean-room rebuild of [peqdb/macos Downmix Renderer](https://github.com/peqdb/macos) with:
+- **Just want to use it?** Read [Install and use](#install-and-use).
+- **Want to read or change the code?** Read [For developers](#for-developers).
+
+Requirements: macOS 15 or later, on Apple silicon or Intel.
+
+---
+
+# Install and use
+
+Downmix needs a helper called **BlackHole** to hear the surround audio. Part 1 sets that
+up. You only do parts 1 and 2 once.
+
+## Part 1 — Set up BlackHole
+
+BlackHole is a free, open-source audio driver. macOS has no built-in way to hand
+16 channels of audio from one app to another, so this fills that gap.
+
+1. Go to [existential.audio/blackhole](https://existential.audio/blackhole/) and download
+   **BlackHole 16ch**. (The site asks for an email address; the download link arrives by
+   mail. There is also a free download on its
+   [GitHub releases page](https://github.com/ExistentialAudio/BlackHole/releases) if you
+   would rather skip that.)
+2. Open the downloaded installer and follow its steps. It will ask for your password —
+   installing an audio driver requires it.
+3. Restart your Mac.
+4. Open **Audio MIDI Setup** (press <kbd>⌘</kbd><kbd>Space</kbd>, type its name, press Return).
+5. Select **BlackHole 16ch** in the list on the left.
+6. Click **Configure Speakers**.
+7. Set the arrangement to **9.1.6** and make sure channels **1 through 16** are assigned.
+   Click **Apply**, then **Done**.
+
+## Part 2 — Install Downmix
+
+**Before you start:** macOS will show a security warning the first time you open Downmix.
+This is expected. It means the app has not paid for Apple's notarization service, not
+that anything is wrong with it. Steps 4 through 7 walk you through it, and you only do
+this once.
+
+1. [**Download Downmix.zip**](https://github.com/RavitejaKarra24/downmix_renderer/raw/main/Downmix.zip).
+2. Open your **Downloads** folder and double-click **Downmix.zip**. A **Downmix** app icon
+   appears next to it.
+3. Drag **Downmix** into your **Applications** folder.
+4. Double-click **Downmix**. A dialog appears saying *"Apple could not verify 'Downmix' is
+   free of malware that may harm your Mac or compromise your privacy."* Click **Done**.
+   (Do **not** click "Move to Trash".)
+5. Open **System Settings** → **Privacy & Security**. Scroll down to the **Security**
+   section near the bottom. You will see a line saying *"Downmix" was blocked to protect
+   your Mac.* Click **Open Anyway** next to it.
+6. Confirm with Touch ID or your password.
+7. One more dialog appears. Click **Open Anyway**.
+8. Downmix asks for **microphone access**. Click **Allow**. macOS classes every audio input
+   as a microphone, and Downmix needs to open BlackHole as an input to hear your audio.
+   Nothing is recorded and no sound is sent anywhere.
+
+From now on, Downmix opens normally with a double-click.
+
+> If **Open Anyway** is not in System Settings, try opening Downmix again first. macOS only
+> shows the button for a few minutes after a blocked launch.
+
+## Where Downmix appears
+
+Downmix opens a window, puts an icon in your Dock, and adds a small **level meter to your
+menu bar** at the top right of the screen. Closing the window does not quit the app — the
+menu-bar meter stays, and clicking it brings back the controls.
+
+## Using it
+
+1. Open Downmix.
+2. Set **Input** to **BlackHole 16ch**.
+3. Set **Output** to your headphones or speakers.
+4. Leave **Preamp** at **-9.5 dB** to start. Lower it if the sound distorts.
+5. Click **Start**. The meters begin moving when audio is playing.
+6. In **System Settings → Sound → Output**, choose **BlackHole 16ch** so your Mac sends its
+   audio through Downmix.
+
+To stop, click **Stop** in Downmix and set your Sound output back to your headphones or
+speakers.
+
+If your device list is long, use the filter box. You can pin the devices you use most from
+their right-click menu and drag them into the order you like.
+
+## Updating
+
+Download the zip again, drag the new **Downmix** into **Applications**, and click **Replace**
+when asked. There is no automatic updater — the version number is shown in
+**Downmix → About Downmix**, so you can check what you are running.
+
+Two things to expect after an update:
+
+- The security steps 4 through 7 may repeat. That is normal for an app distributed this way.
+- macOS may ask for microphone access again. Click **Allow**.
+
+## Uninstalling
+
+1. Quit Downmix.
+2. Drag **Downmix** from **Applications** to the Trash.
+3. Optional: in Finder press <kbd>⌘</kbd><kbd>⇧</kbd><kbd>G</kbd>, enter
+   `~/Library/Application Support/`, and delete the **Downmix** folder. That is where your
+   settings are stored.
+
+BlackHole is a separate program with its own uninstaller; removing Downmix leaves it in
+place.
+
+## Troubleshooting
+
+**Nothing happens when I double-click the app.** You are probably still at the security
+step. Go back to steps 4 through 7 above.
+
+**The meters never move.** Your Mac is not sending audio to Downmix. Check that
+**System Settings → Sound → Output** is set to **BlackHole 16ch**, and that **Input** in
+Downmix is also **BlackHole 16ch**.
+
+**I hear nothing at all.** Check that **Output** in Downmix is your actual headphones or
+speakers, and that Downmix says **Stop** (meaning it is running) rather than **Start**.
+
+**The sound is distorted or crackly.** Lower the **Preamp** value. If it still crackles,
+raise the buffer size in **Settings**.
+
+**Only some speakers seem to be coming through.** BlackHole is probably not configured as
+9.1.6. Redo Part 1, steps 4 through 7.
+
+**Left and right are swapped.** Turn on **Swap L/R** in **Settings**.
+
+**It stopped working after I unplugged my headphones.** Click **Stop**, then **Start** again.
+
+## Privacy
+
+Downmix processes audio entirely on your Mac. It has no network code and sends nothing
+anywhere. It does not change your system sound settings — you choose those yourself in
+System Settings. Its own settings live in a single file at
+`~/Library/Application Support/Downmix/preferences.json`.
+
+---
+
+# For developers
+
+Native macOS **9.1.6 → stereo** downmixer. A clean-room rebuild of
+[peqdb/macos Downmix Renderer](https://github.com/peqdb/macos) with:
 
 - **SwiftUI** interface (no Python, no WebKit, no localhost server)
 - **Core Audio** dual-device engine
@@ -11,52 +150,71 @@ A clean-room rebuild of [peqdb/macos Downmix Renderer](https://github.com/peqdb/
 - Adaptive Light/Dark appearance, native materials, and an inline menu-bar meter
 - Low idle CPU (audio runs only when started)
 
-## Requirements
+## Clone, build, run
 
-- macOS 15+
-- [BlackHole 16ch](https://existential.audio/blackhole/)
-- In **Audio MIDI Setup**, configure BlackHole 16ch as **9.1.6** with channels 1–16
-
-## Install
-
-Build from source, install to `~/Applications`, and launch:
+Requires the Xcode Command Line Tools (`xcode-select --install`) and Swift 6.2.
 
 ```bash
-./install.sh
+git clone https://github.com/RavitejaKarra24/downmix_renderer.git
+cd downmix_renderer
+./install.sh          # builds, installs to ~/Applications, launches
 ```
 
-Set `OPEN_APP=0` to install without launching, or override the destination with
-`INSTALL_DIR=/path/to/apps`.
+`OPEN_APP=0` installs without launching; `INSTALL_DIR=/path/to/apps` overrides the
+destination.
 
-## Build & run locally
+## Everyday commands
 
 ```bash
-# package ad-hoc signed .app and launch
-Scripts/compile_and_run.sh
+Scripts/check.sh              # swift-format lint, build, DSP checks
+Scripts/compile_and_run.sh    # package ad-hoc signed .app and relaunch
+Scripts/package_app.sh release  # build the .app only
+Scripts/package_zip.sh        # build universal, sign, archive, re-verify Downmix.zip
 ```
 
-Or:
+A locally built app is never quarantined, so you will not see the Gatekeeper prompt that
+the install section describes. To reproduce what a user sees, download the zip from GitHub
+on another machine or a fresh user account.
 
-```bash
-swift build -c release
-Scripts/package_app.sh release
-open Downmix.app
-```
+## Layout
 
-## Usage
+| Path | What it is |
+|---|---|
+| `Sources/Downmix/DownmixApp.swift` | App entry point: main window, Settings, menu-bar extra |
+| `Sources/Downmix/AppState.swift` | Observable app state, start/stop, meter plumbing |
+| `Sources/Downmix/Audio/AudioEngine.swift` | Dual-device Core Audio engine |
+| `Sources/Downmix/Audio/DeviceManager.swift` | Device enumeration and change notifications |
+| `Sources/Downmix/Audio/RingBuffer.swift` | Lock-free buffer between input and output callbacks |
+| `Sources/Downmix/DSP/DownmixProcessor.swift` | Bed matrix, LFE path, preamp |
+| `Sources/Downmix/DSP/Biquad.swift` | Butterworth sections |
+| `Sources/Downmix/Models/` | Bed layout, device info, persisted preferences |
+| `Sources/Downmix/UI/` | SwiftUI views, meters, theme |
+| `Checks/main.swift` | Standalone DSP correctness checks |
+| `Scripts/` | Build, package, icon, and check scripts |
+| `version.env` | `CFBundleShortVersionString`, bundle ID, min OS |
+| `Downmix.zip` | The committed download artifact (see below) |
 
-1. Allow microphone access when prompted (required to open input devices).
-2. Select **BlackHole 16ch** as input and your stereo DAC/headphones as output.
-3. Adjust preamp (default **-9.5 dB**).
-4. Press **Start**.
+## Distribution model
 
-To add equalization, run **EQ for Mac** after Downmix. Keep BlackHole as the macOS default,
-select a physical stereo output in Downmix, then toggle EQ for Mac on. EQ for Mac
-uses a device-scoped tap on Downmix’s saved physical output, so it no longer mutes
-or collapses the 16-channel BlackHole feed.
+Downmix is **ad-hoc signed** (`codesign --sign -`) and shipped as a zip committed at the
+repo root. There is no Developer ID and no notarization, because both require a paid
+$99/year Apple Developer membership. That is a deliberate trade-off, not an oversight —
+please don't add notarization steps to the build scripts, as they cannot be run.
 
-Device cards can be filtered when the list is long. Pin devices from their context menu,
-then drag pinned devices into the order you use most.
+The consequence is the one-time Gatekeeper detour documented in the install section, and
+that macOS may re-prompt for microphone access after an update, since TCC grants are tied
+to a code signature that changes with every ad-hoc build.
+
+`Scripts/package_zip.sh` is the only supported way to regenerate the download. It builds a
+universal binary, ad-hoc signs it, verifies the signature, archives with
+`ditto -c -k --keepParent` — never `zip`, which drops the metadata the signature depends on
+and produces an app that silently fails to launch — then unpacks its own output to a temp
+directory and re-verifies there.
+
+When making a user-facing change: bump `MARKETING_VERSION` in `version.env`, run
+`Scripts/package_zip.sh`, and commit the regenerated `Downmix.zip` in the same commit. Git
+will not warn you about a stale artifact. If the app ever outgrows ~10 MB, move the zip to
+GitHub Releases instead of committing it.
 
 ## DSP notes
 
@@ -77,7 +235,18 @@ then drag pinned devices into the order you use most.
 | Web meter relayout | Native AppKit meter surface |
 | Default 64-frame buffer | Default **128** frames |
 
-Measured on the development Mac: about **1% CPU minimized while rendering**, and **0% settled CPU when stopped**.
+Measured on the development Mac: about **1% CPU minimized while rendering**, and **0%
+settled CPU when stopped**.
+
+## Limitations
+
+- 48 kHz only; other sample rates are not resampled.
+- Requires BlackHole 16ch configured as 9.1.6; no other virtual device is detected specially.
+- No auto-update mechanism.
+- Equalization is out of scope. To add it, run **EQ for Mac** after Downmix: keep BlackHole
+  as the macOS default, select a physical stereo output in Downmix, then toggle EQ for Mac
+  on. It uses a device-scoped tap on Downmix's saved physical output, so it no longer mutes
+  or collapses the 16-channel BlackHole feed.
 
 ## License
 

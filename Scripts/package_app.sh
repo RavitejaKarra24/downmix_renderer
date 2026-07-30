@@ -182,12 +182,43 @@ PLIST
 fi
 
 if [[ "$SIGNING_MODE" == "adhoc" || -z "$APP_IDENTITY" ]]; then
-  CODESIGN_ARGS=(--force --sign "-")
+  CODESIGN_ARGS=(--force --sign "-" --timestamp=none)
 else
   CODESIGN_ARGS=(--force --timestamp --options runtime --sign "$APP_IDENTITY")
 fi
 
 # Sign embedded frameworks and their nested binaries before the app bundle.
+# Sign nested resource bundles before the app bundle. Signatures nest inside-out:
+# signing the parent first is invalidated the moment a child is touched. SwiftPM
+# emits flat bundles, which codesign rejects unless they carry an Info.plist.
+sign_resource_bundles() {
+  local bundle
+  for bundle in "$APP/Contents/Resources/"*.bundle; do
+    if [[ ! -d "$bundle" ]]; then
+      continue
+    fi
+    if [[ ! -f "$bundle/Info.plist" && ! -f "$bundle/Contents/Info.plist" ]]; then
+      local bundle_name
+      bundle_name=$(basename "$bundle" .bundle)
+      cat > "$bundle/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key><string>${bundle_name}</string>
+    <key>CFBundleIdentifier</key><string>${BUNDLE_ID}.${bundle_name}</string>
+    <key>CFBundlePackageType</key><string>BNDL</string>
+    <key>CFBundleShortVersionString</key><string>${MARKETING_VERSION}</string>
+    <key>CFBundleVersion</key><string>${BUILD_NUMBER}</string>
+</dict>
+</plist>
+PLIST
+    fi
+    codesign "${CODESIGN_ARGS[@]}" "$bundle"
+  done
+}
+sign_resource_bundles
+
 sign_frameworks() {
   local fw
   for fw in "$APP/Contents/Frameworks/"*.framework; do
