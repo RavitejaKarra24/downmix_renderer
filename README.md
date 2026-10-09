@@ -54,8 +54,9 @@ this once.
    your Mac.* Click **Open Anyway** next to it.
 6. Confirm with Touch ID or your password.
 7. One more dialog appears. Click **Open Anyway**.
-8. Downmix asks for **microphone access**. Click **Allow**. macOS classes every audio input
-   as a microphone, and Downmix needs to open BlackHole as an input to hear your audio.
+8. When you first click **Start**, Downmix asks for **microphone access**. Click **Allow**.
+   macOS classes every audio input as a microphone, and Downmix needs to open BlackHole
+   as an input to hear your audio.
    Nothing is recorded and no sound is sent anywhere.
 
 From now on, Downmix opens normally with a double-click.
@@ -84,6 +85,18 @@ speakers.
 
 If your device list is long, use the filter box. You can pin the devices you use most from
 their right-click menu and drag them into the order you like.
+
+**Setup Checklist** explains the selected device, 48 kHz, permission, and manual speaker/routing
+requirements. **Advanced** shows buffer negotiation and current-run diagnostics. Queue latency
+is only the audio waiting inside Downmix, not your total listening latency.
+Small differences between the two 48 kHz device clocks are corrected automatically.
+This uses a reservoir of at least **42.7 ms**, increasing with larger device buffers;
+initial priming is silent. It does not support other nominal sample rates.
+Device setup and cleanup run in the background; Stop mutes future callbacks without
+waiting for cleanup (already-buffered hardware audio may finish).
+
+After an error, reconnect the saved devices and use **Retry** (⌘⇧R). Retry never picks a
+different output automatically. Failure counters remain visible until a new run or an explicit stop.
 
 ## Updating
 
@@ -127,7 +140,19 @@ raise the buffer size in **Settings**.
 
 **Left and right are swapped.** Turn on **Swap L/R** in **Settings**.
 
-**It stopped working after I unplugged my headphones.** Click **Stop**, then **Start** again.
+**It stopped working after I unplugged my headphones.** Downmix stops rather than silently
+switching outputs. Reconnect your saved device or select another output, then click **Start**.
+Saved device selections are retained while disconnected.
+
+**It says settings could not be saved.** Use **Retry Save** in the window, Settings, or
+menu controls after correcting the file/access problem. This saves settings only; it
+does not start audio. Audio-route **Retry** is separate.
+
+**It says microphone access is required.** Enable **Downmix** in **System Settings →
+Privacy & Security → Microphone**, then retry **Start**.
+
+**It says a device must be at 48 kHz.** Set both selected devices to **48,000 Hz** in
+**Audio MIDI Setup**, then retry. Downmix does not resample other device rates.
 
 ## Privacy
 
@@ -152,7 +177,10 @@ Native macOS **9.1.6 → stereo** downmixer. A clean-room rebuild of
 
 ## Clone, build, run
 
-Requires the Xcode Command Line Tools (`xcode-select --install`) and Swift 6.2.
+Requires the Xcode Command Line Tools (`xcode-select --install`) and Swift 6.2 or later.
+Use a complete stable macOS SDK; the local macOS 27 beta Command Line Tools currently lack a
+SwiftUI macro plugin. If affected, select an installed stable SDK with `SDKROOT` as shown in
+[future.md](future.md).
 
 ```bash
 git clone https://github.com/RavitejaKarra24/downmix_renderer.git
@@ -166,7 +194,15 @@ destination.
 ## Everyday commands
 
 ```bash
-Scripts/check.sh              # swift-format lint, build, DSP checks
+Scripts/check.sh              # formatting/shell/build and deterministic source/archive regressions
+Scripts/check_release.sh      # additionally requires rendered native UI; desktop session required
+Scripts/verify_archive.sh     # read-only signature, universal metadata and build-input digest check
+Scripts/check_realtime.sh --tsan        # concurrent mailbox tests with Thread Sanitizer
+Scripts/check_audio_transport.sh --tsan # callback safety/counter tests with Thread Sanitizer
+Scripts/check_clock_drift.sh --tsan     # offline resampler/clock checks with Thread Sanitizer
+Scripts/check_hal.sh --tsan             # actual engine with isolated HAL API stubs, no real devices
+Scripts/check_metering.sh               # native reset/ballistics and settled repaint timer checks
+Scripts/check_ui.sh --rendered          # native AX/action checks; fake backend, desktop session required
 Scripts/compile_and_run.sh    # package ad-hoc signed .app and relaunch
 Scripts/package_app.sh release  # build the .app only
 Scripts/package_zip.sh        # build universal, sign, archive, re-verify Downmix.zip
@@ -182,14 +218,26 @@ on another machine or a fresh user account.
 |---|---|
 | `Sources/Downmix/DownmixApp.swift` | App entry point: main window, Settings, menu-bar extra |
 | `Sources/Downmix/AppState.swift` | Observable app state, start/stop, meter plumbing |
-| `Sources/Downmix/Audio/AudioEngine.swift` | Dual-device Core Audio engine |
+| `Sources/Downmix/Audio/AudioEngine.swift` | Serial-queue dual-device Core Audio worker |
+| `Sources/Downmix/Audio/AsyncAudioEngineController.swift` | Main-actor intent, cancellation and stale-delivery filtering |
+| `Sources/Downmix/Audio/AdaptiveStereoResampler.swift` | Preallocated sinc reconstruction and adaptive clock correction |
 | `Sources/Downmix/Audio/DeviceManager.swift` | Device enumeration and change notifications |
 | `Sources/Downmix/Audio/RingBuffer.swift` | Lock-free buffer between input and output callbacks |
+| `Sources/Downmix/Audio/RealtimeMailbox.swift` | Preallocated POD configuration/meter transport |
+| `Sources/Downmix/Audio/AudioDiagnostics.swift` | Atomic per-run callback counters |
+| `Sources/Downmix/Audio/StereoOutputRenderer.swift` | Byte-bounded stereo playback/silence and underrun accounting |
 | `Sources/Downmix/DSP/DownmixProcessor.swift` | Bed matrix, LFE path, preamp |
 | `Sources/Downmix/DSP/Biquad.swift` | Butterworth sections |
 | `Sources/Downmix/Models/` | Bed layout, device info, persisted preferences |
 | `Sources/Downmix/UI/` | SwiftUI views, meters, theme |
-| `Checks/main.swift` | Standalone DSP correctness checks |
+| `Checks/main.swift` | DSP and stereo ring-buffer regression checks |
+| `Checks/Preferences/`, `Checks/Lifecycle/` | Isolated preference, setup/retry/diagnostics and transport/device lifecycle checks |
+| `Checks/Realtime/`, `Checks/AudioTransport/` | POD mailbox/DSP concurrency and output-buffer safety checks |
+| `Checks/ClockDrift/`, `Checks/AsyncControl/`, `Checks/UI/` | Offline clocks, delayed control/catalog, native hosted/rendered UI checks |
+| `Checks/HAL/`, `Checks/Metering/`, `Checks/Release/` | Isolated actual-engine safety/lifetime, native meter/timer and failure-gated archive regressions |
+| `docs/profiling.md`, `docs/ui-validation.md` | Runtime profiling and automated/manual UI qualification |
+| `.github/workflows/check.yml` | Stable macOS lint/build/regression/sanitizer CI |
+| `future.md` | Prioritized engineering roadmap, implementation record, manual release gate |
 | `Scripts/` | Build, package, icon, and check scripts |
 | `version.env` | `CFBundleShortVersionString`, bundle ID, min OS |
 | `Downmix.zip` | The committed download artifact (see below) |
@@ -209,7 +257,11 @@ to a code signature that changes with every ad-hoc build.
 universal binary, ad-hoc signs it, verifies the signature, archives with
 `ditto -c -k --keepParent` — never `zip`, which drops the metadata the signature depends on
 and produces an app that silently fails to launch — then unpacks its own output to a temp
-directory and re-verifies there.
+directory and re-verifies there. Packaging requires the rendered native UI gate and a logged-in
+macOS desktop session. The extracted app must match the expected version/build, bundle ID,
+minimum OS, microphone permission text and both architectures. A signed `SourceDigest` records
+current Swift/build inputs (including uncommitted files); stale downloads fail local/CI
+verification. This is a stale-artifact guard, not independent build provenance or hardware qualification.
 
 When making a user-facing change: bump `MARKETING_VERSION` in `version.env`, run
 `Scripts/package_zip.sh`, and commit the regenerated `Downmix.zip` in the same commit. Git
@@ -231,16 +283,22 @@ GitHub Releases instead of committing it.
 |---|---|
 | Python + pywebview + WebKit | Native SwiftUI |
 | Local HTTP + SSE status | Direct in-process meters |
-| Always-on launcher stack | **0% settled CPU** when stopped |
+| Always-on launcher stack | Audio stopped unless rendering/keep-alive; settled meter repaint timers sleep |
 | Web meter relayout | Native AppKit meter surface |
 | Default 64-frame buffer | Default **128** frames |
 
-Measured on the development Mac: about **1% CPU minimized while rendering**, and **0%
-settled CPU when stopped**.
+An earlier build measured about **1% CPU minimized while rendering**, and **0% settled CPU
+when stopped** on the development Mac. The new mailbox/diagnostics release has not yet been
+hardware-profiled; see [profiling instructions](docs/profiling.md) rather than assuming the same numbers.
 
 ## Limitations
 
-- 48 kHz only; other sample rates are not resampled.
+- 48 kHz only; unsupported rates are rejected and running routes stop if the rate changes.
+- Configuration/meters now use preallocated POD mailboxes instead of a shared DSP lock.
+  Off-main setup/teardown and bounded independent-device clock correction are implemented.
+  Runtime Instruments/CPU profiling and hardware qualification remain pending in
+  [future.md](future.md); all-day dropout-free playback is not yet certified.
+- Changing devices or buffer size restarts the active route; a brief interruption is expected.
 - Requires BlackHole 16ch configured as 9.1.6; no other virtual device is detected specially.
 - No auto-update mechanism.
 - Equalization is out of scope. To add it, run **EQ for Mac** after Downmix: keep BlackHole

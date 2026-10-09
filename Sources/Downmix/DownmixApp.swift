@@ -18,6 +18,12 @@ struct DownmixApp: App {
           appState.toggle()
         }
         .keyboardShortcut(.space, modifiers: [.command, .shift])
+
+        Button("Retry Saved Route") {
+          appState.retrySavedRoute()
+        }
+        .keyboardShortcut("r", modifiers: [.command, .shift])
+        .disabled(!appState.canRetrySavedRoute)
       }
     }
 

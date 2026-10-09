@@ -5,6 +5,7 @@ import SwiftUI
 
 struct MenuBarView: View {
   @Environment(AppState.self) private var state
+  @Environment(\.openWindow) private var openWindow
 
   var body: some View {
     VStack(alignment: .leading, spacing: 8) {
@@ -15,6 +16,8 @@ struct MenuBarView: View {
         Image(systemName: statusSymbol)
           .foregroundStyle(statusColor)
       }
+      .accessibilityElement(children: .combine)
+      .accessibilityIdentifier("menu.status")
 
       Label {
         CompactStereoMeter(source: state.meterSource)
@@ -44,12 +47,35 @@ struct MenuBarView: View {
           systemImage: state.isRunning ? "stop.fill" : "play.fill"
         )
       }
+      .accessibilityIdentifier("menu.transport")
+
+      if state.errorMessage != nil || state.status.phase == .error {
+        Button {
+          state.retrySavedRoute()
+        } label: {
+          Label("Retry Saved Route", systemImage: "arrow.clockwise.circle")
+        }
+        .accessibilityIdentifier("menu.retry")
+        .disabled(!state.canRetrySavedRoute)
+        .accessibilityHint("Rescans devices without falling back to another route")
+      }
+
+      PersistenceFailureView(surface: "menu")
 
       Button {
         state.refreshDevices()
       } label: {
         Label("Refresh Devices", systemImage: "arrow.clockwise")
       }
+      .accessibilityIdentifier("menu.refresh")
+
+      Button {
+        openWindow(id: "main")
+        NSApp.activate(ignoringOtherApps: true)
+      } label: {
+        Label("Show Downmix", systemImage: "macwindow")
+      }
+      .accessibilityIdentifier("menu.showWindow")
 
       Divider()
 
@@ -58,6 +84,7 @@ struct MenuBarView: View {
       } label: {
         Label("Quit Downmix", systemImage: "power")
       }
+      .accessibilityIdentifier("menu.quit")
     }
     .frame(width: 240, alignment: .leading)
     .padding(.vertical, 4)
@@ -85,6 +112,8 @@ struct MenuBarView: View {
 }
 
 struct MenuBarStatusIcon: View {
+  @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
   let source: MeterSource
   let isRunning: Bool
 
@@ -102,7 +131,7 @@ struct MenuBarStatusIcon: View {
         .transition(.opacity)
       }
     }
-    .animation(.easeOut(duration: 0.15), value: isRunning)
+    .animation(reduceMotion ? nil : .easeOut(duration: 0.15), value: isRunning)
     .onAppear(perform: updateSnapshot)
     .onReceive(
       NotificationCenter.default.publisher(for: .downmixMetersDidChange, object: source)
@@ -110,7 +139,9 @@ struct MenuBarStatusIcon: View {
     ) { _ in
       updateSnapshot()
     }
+    .accessibilityElement(children: .ignore)
     .accessibilityLabel(isRunning ? "Downmix is rendering" : "Downmix is stopped")
+    .accessibilityIdentifier("menu.statusIcon")
   }
 
   private func levelBar(_ db: Float) -> some View {
@@ -147,6 +178,7 @@ private struct CompactStereoMeter: View {
     }
     .accessibilityElement(children: .ignore)
     .accessibilityLabel("Stereo output level")
+    .accessibilityIdentifier("menu.stereoMeter")
     .accessibilityValue(accessibilityValue)
   }
 
@@ -209,30 +241,35 @@ struct SettingsView: View {
   @State private var selection: DownmixSettingsTab = .general
 
   var body: some View {
-    TabView(selection: $selection) {
-      GeneralSettingsPane()
-        .tabItem {
-          Label("General", systemImage: "gearshape")
-        }
-        .tag(DownmixSettingsTab.general)
+    VStack(spacing: 0) {
+      PersistenceFailureView(surface: "settings")
+        .padding(.horizontal, 12)
+      TabView(selection: $selection) {
+        GeneralSettingsPane()
+          .tabItem {
+            Label("General", systemImage: "gearshape")
+          }
+          .tag(DownmixSettingsTab.general)
 
-      AudioSettingsPane()
-        .tabItem {
-          Label("Audio", systemImage: "speaker.wave.2")
-        }
-        .tag(DownmixSettingsTab.audio)
+        AudioSettingsPane()
+          .tabItem {
+            Label("Audio", systemImage: "speaker.wave.2")
+          }
+          .tag(DownmixSettingsTab.audio)
 
-      AdvancedSettingsPane()
-        .tabItem {
-          Label("Advanced", systemImage: "slider.horizontal.3")
-        }
-        .tag(DownmixSettingsTab.advanced)
+        AdvancedSettingsPane()
+          .tabItem {
+            Label("Advanced", systemImage: "slider.horizontal.3")
+          }
+          .tag(DownmixSettingsTab.advanced)
 
-      AboutSettingsPane()
-        .tabItem {
-          Label("About", systemImage: "info.circle")
-        }
-        .tag(DownmixSettingsTab.about)
+        AboutSettingsPane()
+          .tabItem {
+            Label("About", systemImage: "info.circle")
+          }
+          .tag(DownmixSettingsTab.about)
+      }
+      .accessibilityIdentifier("settings.tabs")
     }
     .frame(width: 560, height: 430)
   }
@@ -255,6 +292,8 @@ private struct GeneralSettingsPane: View {
           }
         }
         .toggleStyle(.switch)
+        .accessibilityLabel("Auto-start renderer when launched")
+        .accessibilityIdentifier("settings.autoStart")
         .onChange(of: state.preferences.autoStart) { _, _ in
           state.persist()
         }
@@ -274,6 +313,7 @@ private struct GeneralSettingsPane: View {
             systemImage: state.isRunning ? "stop.fill" : "play.fill"
           )
         }
+        .accessibilityIdentifier("settings.transport")
       }
     }
   }
@@ -308,20 +348,24 @@ private struct AudioSettingsPane: View {
     SettingsForm {
       Section("Devices") {
         Picker("Input", selection: inputSelection) {
-          ForEach(state.inputDevices.filter { $0.inputChannelCount >= 2 }) { device in
+          Text("Select input").tag(Optional<AudioDeviceID>.none)
+          ForEach(state.inputDevices.filter { $0.inputChannelCount >= 16 }) { device in
             Text(device.name)
               .tag(Optional(device.id))
           }
         }
         .pickerStyle(.menu)
+        .accessibilityIdentifier("settings.input")
 
         Picker("Output", selection: outputSelection) {
+          Text("Select output").tag(Optional<AudioDeviceID>.none)
           ForEach(state.outputDevices.filter { $0.outputChannelCount >= 2 }) { device in
             Text(device.name)
               .tag(Optional(device.id))
           }
         }
         .pickerStyle(.menu)
+        .accessibilityIdentifier("settings.output")
 
         HStack {
           Spacer()
@@ -330,7 +374,12 @@ private struct AudioSettingsPane: View {
           } label: {
             Label("Refresh Devices", systemImage: "arrow.clockwise")
           }
+          .accessibilityIdentifier("settings.refresh")
         }
+      }
+
+      Section("Setup") {
+        SetupChecklistButton()
       }
 
       Section("Downmix") {
@@ -347,10 +396,13 @@ private struct AudioSettingsPane: View {
           }
         }
         .pickerStyle(.menu)
+        .accessibilityIdentifier("settings.layout")
 
         LabeledContent("Preamp") {
           HStack(spacing: 12) {
             Slider(value: $state.preferences.preampDb, in: -30...6, step: 0.1)
+              .accessibilityLabel("Preamp")
+              .accessibilityIdentifier("settings.preamp")
               .frame(width: 220)
             Text(String(format: "%.1f dB", state.preferences.preampDb))
               .monospacedDigit()
@@ -371,12 +423,15 @@ private struct AudioSettingsPane: View {
           }
         }
         .toggleStyle(.switch)
+        .accessibilityLabel("LFE Butterworth 125 Hz")
+        .accessibilityIdentifier("settings.lfeLowpass")
         .onChange(of: state.preferences.lfeLowpass) { _, _ in
           state.persist()
         }
 
         Toggle("Swap left and right outputs", isOn: $state.preferences.swapOutputs)
           .toggleStyle(.switch)
+          .accessibilityIdentifier("settings.swapOutputs")
           .onChange(of: state.preferences.swapOutputs) { _, _ in
             state.persist()
           }
@@ -429,14 +484,22 @@ private struct AdvancedSettingsPane: View {
               .monospacedDigit()
               .frame(width: 86, alignment: .trailing)
           }
+          .accessibilityLabel("I/O buffer")
+          .accessibilityIdentifier("settings.framesPerBuffer")
         }
         .onChange(of: state.preferences.framesPerBuffer) { _, _ in
           state.persist()
         }
 
-        Text("128 frames balances low latency with lower CPU and power use.")
-          .font(.caption)
-          .foregroundStyle(.secondary)
+        Text(
+          "128 frames balances latency and power use. Changing this restarts the active audio route."
+        )
+        .font(.caption)
+        .foregroundStyle(.secondary)
+      }
+
+      Section("Diagnostics") {
+        EngineDiagnosticsView()
       }
 
       Section("Output") {
@@ -449,6 +512,8 @@ private struct AdvancedSettingsPane: View {
           }
         }
         .toggleStyle(.switch)
+        .accessibilityLabel("Keep output awake")
+        .accessibilityIdentifier("settings.keepOutputAlive")
         .onChange(of: state.preferences.keepOutputAlive) { _, isEnabled in
           state.persist()
           if isEnabled {

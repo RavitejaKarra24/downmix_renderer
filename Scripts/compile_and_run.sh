@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Kill running instances, package, relaunch, verify.
+# Check and package successfully before stopping existing instances; relaunch, verify.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -29,15 +29,9 @@ for arg in "$@"; do
   esac
 done
 
-log "==> Killing existing ${APP_NAME} instances"
-pkill -f "${APP_PROCESS_PATTERN}" 2>/dev/null || true
-pkill -f "${DEBUG_PROCESS_PATTERN}" 2>/dev/null || true
-pkill -f "${RELEASE_PROCESS_PATTERN}" 2>/dev/null || true
-pkill -x "${APP_NAME}" 2>/dev/null || true
-
 if [[ "${RUN_TESTS}" == "1" ]]; then
-  log "==> swift test"
-  swift test -q
+  log "==> repository release checks"
+  "${ROOT_DIR}/Scripts/check_release.sh"
 fi
 
 HOST_ARCH="$(uname -m)"
@@ -48,6 +42,12 @@ fi
 
 log "==> package app"
 SIGNING_MODE=adhoc ARCHES="${ARCHES_VALUE}" "${ROOT_DIR}/Scripts/package_app.sh" release
+
+log "==> Killing existing ${APP_NAME} instances"
+pkill -f "${APP_PROCESS_PATTERN}" 2>/dev/null || true
+pkill -f "${DEBUG_PROCESS_PATTERN}" 2>/dev/null || true
+pkill -f "${RELEASE_PROCESS_PATTERN}" 2>/dev/null || true
+pkill -x "${APP_NAME}" 2>/dev/null || true
 
 log "==> launch app"
 if ! open "${APP_BUNDLE}"; then

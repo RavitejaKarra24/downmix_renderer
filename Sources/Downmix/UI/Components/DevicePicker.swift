@@ -1,22 +1,15 @@
 import CoreAudio
 import SwiftUI
 
-struct DevicePickerCard: View {
-  let title: String
+/// One ordering projection for rendering and keyboard/AX favorite moves. The persisted
+/// list is shared by both pickers and can also contain disconnected or filtered UIDs.
+struct DevicePickerOrdering {
+  let favorites: [String]
   let devices: [AudioDeviceInfo]
-  let selectedID: AudioDeviceID?
-  let emptyHint: String
-  let onSelect: (AudioDeviceInfo) -> Void
 
-  @AppStorage("downmix.favoriteDeviceUIDs") private var favoriteDeviceUIDs = ""
-  @State private var searchText = ""
-
-  private var favoriteUIDs: [String] {
-    favoriteDeviceUIDs.split(separator: "\n").map(String.init)
-  }
-
-  private var visibleDevices: [AudioDeviceInfo] {
-    let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+  init(devices: [AudioDeviceInfo], favorites: [String], query: String = "") {
+    self.favorites = favorites
+    let query = query.trimmingCharacters(in: .whitespacesAndNewlines)
     let filtered =
       query.isEmpty
       ? devices
@@ -24,8 +17,7 @@ struct DevicePickerCard: View {
         $0.name.localizedCaseInsensitiveContains(query)
           || $0.subtitle.localizedCaseInsensitiveContains(query)
       }
-    let favorites = favoriteUIDs
-    return filtered.sorted { lhs, rhs in
+    self.devices = filtered.sorted { lhs, rhs in
       let lhsIndex = favorites.firstIndex(of: lhs.uid)
       let rhsIndex = favorites.firstIndex(of: rhs.uid)
       switch (lhsIndex, rhsIndex) {
@@ -42,6 +34,48 @@ struct DevicePickerCard: View {
       }
     }
   }
+
+  func favoriteNeighbor(_ uid: String, offset: Int) -> String? {
+    guard offset == -1 || offset == 1 else { return nil }
+    let visibleFavorites = devices.map(\.uid).filter { favorites.contains($0) }
+    guard let index = visibleFavorites.firstIndex(of: uid),
+      visibleFavorites.indices.contains(index + offset)
+    else { return nil }
+    return visibleFavorites[index + offset]
+  }
+
+  func movingFavorite(_ uid: String, offset: Int) -> [String] {
+    guard let neighbor = favoriteNeighbor(uid, offset: offset),
+      let source = favorites.firstIndex(of: uid),
+      let target = favorites.firstIndex(of: neighbor)
+    else { return favorites }
+    // Swap only applicable slots: other pickers, disconnected devices and search
+    // exclusions retain their positions and UIDs. Drag-to-insert remains separate.
+    var result = favorites
+    result.swapAt(source, target)
+    return result
+  }
+}
+
+struct DevicePickerCard: View {
+  let title: String
+  let devices: [AudioDeviceInfo]
+  let selectedID: AudioDeviceID?
+  let emptyHint: String
+  let onSelect: (AudioDeviceInfo) -> Void
+
+  @AppStorage("downmix.favoriteDeviceUIDs") private var favoriteDeviceUIDs = ""
+  @State private var searchText = ""
+
+  private var favoriteUIDs: [String] {
+    favoriteDeviceUIDs.split(separator: "\n").map(String.init)
+  }
+
+  private var ordering: DevicePickerOrdering {
+    DevicePickerOrdering(devices: devices, favorites: favoriteUIDs, query: searchText)
+  }
+
+  private var visibleDevices: [AudioDeviceInfo] { ordering.devices }
 
   var body: some View {
     VStack(alignment: .leading, spacing: 12) {
@@ -69,6 +103,8 @@ struct DevicePickerCard: View {
         Label {
           TextField("Filter devices", text: $searchText)
             .textFieldStyle(.plain)
+            .accessibilityLabel("Filter \(title.lowercased()) devices")
+            .accessibilityIdentifier("device.\(title.lowercased()).filter")
         } icon: {
           Image(systemName: "magnifyingglass")
             .foregroundStyle(DownmixTheme.textSecondary)
@@ -112,12 +148,15 @@ struct DevicePickerCard: View {
     .downmixRaisedPanel()
     .accessibilityElement(children: .contain)
     .accessibilityLabel("\(title) device picker")
+    .accessibilityIdentifier("device.\(title.lowercased()).picker")
   }
 
   private func deviceRow(_ device: AudioDeviceInfo) -> some View {
     let selected = device.id == selectedID
     let isVirtual = device.name.localizedCaseInsensitiveContains("blackhole")
     let isFavorite = favoriteUIDs.contains(device.uid)
+    let canMoveUp = ordering.favoriteNeighbor(device.uid, offset: -1) != nil
+    let canMoveDown = ordering.favoriteNeighbor(device.uid, offset: 1) != nil
 
     return Button {
       onSelect(device)
@@ -201,14 +240,36 @@ struct DevicePickerCard: View {
           systemImage: isFavorite ? "pin.slash" : "pin"
         )
       }
+      .accessibilityIdentifier("device.\(title.lowercased()).\(device.uid).favorite")
+      Button("Move Favorite Up") { moveFavorite(device.uid, offset: -1) }
+        .disabled(!canMoveUp)
+        .accessibilityIdentifier("device.\(title.lowercased()).\(device.uid).moveUp")
+      Button("Move Favorite Down") { moveFavorite(device.uid, offset: 1) }
+        .disabled(!canMoveDown)
+        .accessibilityIdentifier("device.\(title.lowercased()).\(device.uid).moveDown")
+    }
+    .accessibilityIdentifier("device.\(title.lowercased()).\(device.uid)")
+    .accessibilityValue(selected ? "Selected" : "Not selected")
+    .accessibilityActions {
+      Button(isFavorite ? "Remove from Favorites" : "Add to Favorites") {
+        toggleFavorite(device.uid)
+      }
+      if canMoveUp {
+        Button("Move Favorite Up") { moveFavorite(device.uid, offset: -1) }
+      }
+      if canMoveDown {
+        Button("Move Favorite Down") { moveFavorite(device.uid, offset: 1) }
+      }
     }
     .accessibilityLabel(
       "\(device.name), \(device.subtitle)\(selected ? ", selected and connected" : "")"
     )
     .accessibilityHint(
       healthWarning(for: device)
-        .map { "\($0) Selects this device. Drag to reorder favorites." }
-        ?? "Selects this device. Drag to reorder favorites."
+        .map {
+          "\($0) Selects this device. Use the context menu or accessibility actions to manage favorites."
+        }
+        ?? "Selects this device. Use the context menu or accessibility actions to manage favorites."
     )
   }
 
@@ -266,6 +327,12 @@ struct DevicePickerCard: View {
     } else {
       favorites.append(uid)
     }
+    favoriteDeviceUIDs = favorites.joined(separator: "\n")
+  }
+
+  private func moveFavorite(_ uid: String, offset: Int) {
+    let favorites = ordering.movingFavorite(uid, offset: offset)
+    guard favorites != favoriteUIDs else { return }
     favoriteDeviceUIDs = favorites.joined(separator: "\n")
   }
 

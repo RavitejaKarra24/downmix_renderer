@@ -1,7 +1,9 @@
 import Foundation
 import Synchronization
 
-/// Single-producer / single-consumer lock-free float ring buffer.
+/// Single-producer / single-consumer lock-free interleaved stereo float ring buffer.
+/// Counts are in samples; transfers round down to complete two-sample frames.
+/// Overflow drops the unwritten suffix, never half a stereo frame.
 final class FloatRingBuffer: @unchecked Sendable {
   private let capacity: Int
   private let storage: UnsafeMutablePointer<Float>
@@ -9,8 +11,10 @@ final class FloatRingBuffer: @unchecked Sendable {
   private let writeIndex = Atomic<Int>(0)
 
   init(capacity: Int) {
-    // +1 distinguishes full vs empty.
-    self.capacity = max(capacity + 1, 64)
+    precondition(capacity < Int.max, "Ring capacity must leave room for the sentinel")
+    // At least one stereo frame, with an even usable capacity. +1 marks full vs empty.
+    let usableCapacity = max(capacity, 2) / 2 * 2
+    self.capacity = usableCapacity + 1
     storage = .allocate(capacity: self.capacity)
     storage.initialize(repeating: 0, count: self.capacity)
   }
@@ -20,6 +24,7 @@ final class FloatRingBuffer: @unchecked Sendable {
     storage.deallocate()
   }
 
+  /// Consumer-side snapshot (not a transactional snapshot for a third observer).
   var availableToRead: Int {
     let write = writeIndex.load(ordering: .acquiring)
     let read = readIndex.load(ordering: .relaxed)
@@ -27,13 +32,18 @@ final class FloatRingBuffer: @unchecked Sendable {
     return capacity - read + write
   }
 
+  /// Producer-side snapshot. Acquire the consumer's release before reusing storage.
   var availableToWrite: Int {
-    capacity - 1 - availableToRead
+    let read = readIndex.load(ordering: .acquiring)
+    let write = writeIndex.load(ordering: .relaxed)
+    let used = write >= read ? write - read : capacity - read + write
+    return capacity - 1 - used
   }
 
   @discardableResult
   func write(_ source: UnsafePointer<Float>, count: Int) -> Int {
-    let writable = min(count, availableToWrite)
+    guard count > 0 else { return 0 }
+    let writable = min(count / 2 * 2, availableToWrite)
     if writable == 0 { return 0 }
 
     let currentWrite = writeIndex.load(ordering: .relaxed)
@@ -49,7 +59,8 @@ final class FloatRingBuffer: @unchecked Sendable {
 
   @discardableResult
   func read(into destination: UnsafeMutablePointer<Float>, count: Int) -> Int {
-    let readable = min(count, availableToRead)
+    guard count > 0 else { return 0 }
+    let readable = min(count / 2 * 2, availableToRead)
     if readable == 0 { return 0 }
 
     let currentRead = readIndex.load(ordering: .relaxed)
@@ -63,9 +74,9 @@ final class FloatRingBuffer: @unchecked Sendable {
     return readable
   }
 
+  /// Call only after both producer and consumer have stopped.
   func clear() {
     readIndex.store(0, ordering: .relaxed)
     writeIndex.store(0, ordering: .relaxed)
-    storage.update(repeating: 0, count: capacity)
   }
 }

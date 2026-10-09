@@ -1,0 +1,75 @@
+name: Checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: macos-15
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: maxim-lobanov/setup-xcode@1242409711ff5721add51979e9e11e23ebb7e5a4 # v1
+        with:
+          xcode-version: '26.2'
+      - name: Verify stable Xcode, Swift 6.2+, and full macOS SDK
+        run: |
+          set -euo pipefail
+          xcode_version="$(xcodebuild -version)"
+          printf '%s\n' "$xcode_version"
+          [[ "${xcode_version%%$'\n'*}" == 'Xcode 26.2' ]]
+          xcrun swiftc --version
+          xcrun swiftc --version | awk '
+            /Apple Swift version/ {
+              split($4, v, ".")
+              ok = (v[1] > 6 || (v[1] == 6 && v[2] >= 2))
+            }
+            END { exit !ok }
+          '
+          sdk="$(xcrun --sdk macosx --show-sdk-path)"
+          printf 'SDKROOT=%s\n' "$sdk" >> "$GITHUB_ENV"
+          xcrun --sdk macosx --show-sdk-version
+          [[ -d "$sdk/System/Library/Frameworks/AppKit.framework" ]]
+          probe="$(mktemp -d "${TMPDIR:-/tmp}/downmix-sdk-check.XXXXXX")"
+          trap 'rm -rf "$probe"' EXIT
+          printf 'import AppKit\nimport CoreAudio\nimport Synchronization\n' > "$probe/probe.swift"
+          xcrun swiftc -swift-version 6 -sdk "$sdk" -typecheck "$probe/probe.swift"
+      - name: Whitespace and shell syntax
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$BASE_SHA" && ! "$BASE_SHA" =~ ^0+$ ]] && ! git cat-file -e "${BASE_SHA}^{commit}"; then
+            git fetch --no-tags origin "$BASE_SHA"
+          fi
+          Scripts/check_whitespace.sh "$BASE_SHA" "$HEAD_SHA"
+          while IFS= read -r -d '' script; do
+            /bin/bash -n "$script"
+          done < <(find Scripts Checks -type f -name '*.sh' -print0)
+      - name: Verify committed universal download matches current source inputs
+        run: Scripts/verify_archive.sh
+      - name: Universal packaging smoke test
+        run: Scripts/package_zip.sh
+      - name: Realtime ThreadSanitizer checks
+        run: |
+          set -euo pipefail
+          Scripts/check_realtime.sh --tsan
+          Scripts/check_audio_transport.sh --tsan
+          Scripts/check_clock_drift.sh --tsan
+          Scripts/check_hal.sh --tsan

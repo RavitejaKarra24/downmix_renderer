@@ -21,6 +21,7 @@ struct ContentView: View {
           errorBanner(error)
             .transition(.move(edge: .bottom).combined(with: .opacity))
         }
+        PersistenceFailureView(surface: "main")
       }
       .padding(20)
     }
@@ -74,6 +75,7 @@ struct ContentView: View {
         )
       }
       .buttonStyle(TransportButtonStyle(isRunning: state.isRunning, reduceMotion: reduceMotion))
+      .accessibilityIdentifier("main.transport")
       .accessibilityHint(
         state.isRunning ? "Stops audio rendering" : "Starts audio rendering"
       )
@@ -108,6 +110,7 @@ struct ContentView: View {
     .overlay(Capsule().stroke(statusColor.opacity(0.24), lineWidth: 1))
     .accessibilityElement(children: .combine)
     .accessibilityLabel("Renderer status: \(state.status.message)")
+    .accessibilityIdentifier("main.status")
   }
 
   private var statusColor: Color {
@@ -126,7 +129,7 @@ struct ContentView: View {
         VStack(spacing: 16) {
           DevicePickerCard(
             title: "Input",
-            devices: state.inputDevices.filter { $0.inputChannelCount >= 2 },
+            devices: state.inputDevices.filter { $0.inputChannelCount >= 16 },
             selectedID: state.selectedInputID,
             emptyHint: "Install or enable a multichannel input such as BlackHole 16ch.",
             onSelect: state.selectInput
@@ -184,6 +187,7 @@ struct ContentView: View {
           }
         }
         .labelsHidden()
+        .accessibilityIdentifier("main.layout")
         .pickerStyle(.menu)
         .frame(maxWidth: .infinity, alignment: .leading)
       }
@@ -197,6 +201,10 @@ struct ContentView: View {
       }
       .buttonStyle(SecondaryButtonStyle())
       .help("Rescan Core Audio devices")
+      .accessibilityIdentifier("main.refresh")
+
+      SetupChecklistButton()
+        .buttonStyle(SecondaryButtonStyle())
 
       advancedControls
     }
@@ -231,6 +239,7 @@ struct ContentView: View {
           state.persist()
         }
         .accessibilityLabel("Preamp")
+        .accessibilityIdentifier("main.preamp.slider")
 
       PreampTickMarks(range: -30...6, markedValues: [-9.5, 0])
     }
@@ -254,6 +263,8 @@ struct ContentView: View {
       }
       .toggleStyle(.switch)
       .onChange(of: state.preferences.lfeLowpass) { _, _ in state.persist() }
+      .accessibilityLabel("LFE Butterworth 125 Hz")
+      .accessibilityIdentifier("main.lfeLowpass")
 
       Toggle(isOn: $state.preferences.swapOutputs) {
         optionLabel(
@@ -264,6 +275,8 @@ struct ContentView: View {
       }
       .toggleStyle(.switch)
       .onChange(of: state.preferences.swapOutputs) { _, _ in state.persist() }
+      .accessibilityLabel("Swap L/R outputs")
+      .accessibilityIdentifier("main.swapOutputs")
     }
     .padding(12)
     .downmixRecessedWell(cornerRadius: 12)
@@ -294,6 +307,8 @@ struct ContentView: View {
       }
       .buttonStyle(.plain)
       .foregroundStyle(DownmixTheme.textPrimary)
+      .accessibilityLabel("Advanced")
+      .accessibilityIdentifier("main.advanced")
       .accessibilityValue(state.showAdvanced ? "Expanded" : "Collapsed")
 
       if state.showAdvanced {
@@ -312,6 +327,8 @@ struct ContentView: View {
             )
           }
           .toggleStyle(.switch)
+          .accessibilityLabel("Keep output awake")
+          .accessibilityIdentifier("main.keepOutputAlive")
           .onChange(of: state.preferences.keepOutputAlive) { _, on in
             state.persist()
             if on {
@@ -320,9 +337,14 @@ struct ContentView: View {
               state.stop()
             }
           }
-          Text("128 frames balances low latency with lower CPU use.")
-            .font(DownmixTheme.TypeScale.caption)
-            .foregroundStyle(DownmixTheme.textSecondary)
+          Text(
+            "128 frames balances latency and CPU use. Changing this restarts the active audio route."
+          )
+          .font(DownmixTheme.TypeScale.caption)
+          .foregroundStyle(DownmixTheme.textSecondary)
+
+          Divider()
+          EngineDiagnosticsView()
         }
         .padding(12)
         .downmixRecessedWell(cornerRadius: 12)
@@ -366,6 +388,8 @@ struct ContentView: View {
           .foregroundStyle(DownmixTheme.textPrimary)
           .frame(width: 42, alignment: .trailing)
       }
+      .accessibilityLabel(title)
+      .accessibilityIdentifier("main.framesPerBuffer")
       .onChange(of: value.wrappedValue) { _, _ in
         state.persist()
       }
@@ -379,6 +403,13 @@ struct ContentView: View {
       Text(text)
         .font(DownmixTheme.TypeScale.body)
       Spacer()
+      Button("Retry") {
+        state.retrySavedRoute()
+      }
+      .accessibilityIdentifier("main.retry")
+      .disabled(!state.canRetrySavedRoute)
+      .accessibilityLabel("Retry saved audio route")
+      .accessibilityHint("Rescans devices and starts only the saved input and output")
       Button {
         state.errorMessage = nil
       } label: {
@@ -387,6 +418,7 @@ struct ContentView: View {
       }
       .buttonStyle(.plain)
       .accessibilityLabel("Dismiss error")
+      .accessibilityIdentifier("main.dismissError")
     }
     .foregroundStyle(DownmixTheme.bad)
     .padding(12)
@@ -397,10 +429,42 @@ struct ContentView: View {
     )
     .accessibilityElement(children: .contain)
     .accessibilityLabel("Error: \(text)")
+    .accessibilityIdentifier("main.error")
   }
 
   private func motion(_ animation: Animation) -> Animation? {
     reduceMotion ? nil : animation
+  }
+}
+
+/// Shared save-only recovery on every settings-editing surface. Never sends an
+/// audio transport/configuration command and never dismisses an engine failure.
+struct PersistenceFailureView: View {
+  @Environment(AppState.self) private var state
+  let surface: String
+
+  var body: some View {
+    if let message = state.persistenceErrorMessage {
+      VStack(alignment: .leading, spacing: 8) {
+        Label(message, systemImage: "exclamationmark.triangle.fill")
+          .font(.callout)
+        HStack {
+          Button("Retry Save") { state.retrySavePreferences() }
+            .accessibilityIdentifier("\(surface).retrySave")
+            .accessibilityHint("Saves current settings without starting or stopping audio")
+          Button("Dismiss") { state.dismissPersistenceError() }
+            .accessibilityLabel("Dismiss save error")
+            .accessibilityIdentifier("\(surface).dismissSaveError")
+        }
+      }
+      .foregroundStyle(DownmixTheme.bad)
+      .padding(12)
+      .frame(maxWidth: .infinity, alignment: .leading)
+      .background(DownmixTheme.bad.opacity(0.11), in: RoundedRectangle(cornerRadius: 12))
+      .accessibilityElement(children: .contain)
+      .accessibilityLabel("Settings save error: \(message)")
+      .accessibilityIdentifier("\(surface).saveError")
+    }
   }
 }
 
@@ -464,6 +528,8 @@ private struct DraggableDecibelField: View {
         format: .number.precision(.fractionLength(1))
       )
       .textFieldStyle(.plain)
+      .accessibilityLabel("Preamp decibels")
+      .accessibilityIdentifier("main.preamp.field")
       .multilineTextAlignment(.trailing)
       .frame(width: 43)
       .focused($isEditing)
@@ -506,11 +572,11 @@ private struct DraggableDecibelField: View {
       }
     }
     .help("Type a value or drag horizontally")
-    .accessibilityLabel("Preamp decibels")
   }
 
   private func commit() {
-    let clamped = min(range.upperBound, max(range.lowerBound, draftValue))
+    let finiteValue = draftValue.isFinite ? draftValue : value
+    let clamped = min(range.upperBound, max(range.lowerBound, finiteValue))
     draftValue = clamped
     value = clamped
     onCommit()

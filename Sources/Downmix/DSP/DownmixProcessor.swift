@@ -16,15 +16,43 @@ struct DownmixProcessor: Sendable {
     var inputChannelCount: Int = 16
   }
 
-  private var configuration = Configuration()
+  /// Fixed-size callback payload. Construct on the control side, not in a callback.
+  struct RealtimeConfiguration: BitwiseCopyable, Sendable, Equatable {
+    let channelMap: SIMD16<Int32>
+    let preampDb: Double
+    let lfeLowpass: Bool
+    let swapOutputs: Bool
+    let inputChannelCount: Int
+
+    init(_ configuration: Configuration) {
+      var map = SIMD16<Int32>(repeating: 0)
+      for slot in 0..<min(16, configuration.channelMap.count) {
+        let channel = configuration.channelMap[slot]
+        if channel > 0, let fixedChannel = Int32(exactly: channel) {
+          map[slot] = fixedChannel
+        }
+      }
+      channelMap = map
+      // Preserve the supported gain range and corrupt-settings fallback.
+      let db = configuration.preampDb.isFinite ? configuration.preampDb : -9.5
+      preampDb = min(6, max(-30, db))
+      lfeLowpass = configuration.lfeLowpass
+      swapOutputs = configuration.swapOutputs
+      inputChannelCount = configuration.inputChannelCount
+    }
+  }
+
+  private var configuration = RealtimeConfiguration(Configuration())
   private var masterGain = 1.0
   private var lfeFilterA = BiquadFilter()
   private var lfeFilterB = BiquadFilter()
   private var dryDelayIndex = 0
+  // Allocated before callbacks. Keep the processor single-owned: do not copy or
+  // share it during callbacks, which would trigger Array copy-on-write here.
   private var stereoDelayL: [Double]
   private var stereoDelayR: [Double]
 
-  private var inputPeaks = [Float](repeating: 0, count: 16)
+  private var inputPeaks = SIMD16<Float>(repeating: 0)
   private var outputPeakL: Float = 0
   private var outputPeakR: Float = 0
   private var clipL = false
@@ -33,27 +61,48 @@ struct DownmixProcessor: Sendable {
   init() {
     stereoDelayL = [Double](repeating: 0, count: Self.butterworthDryDelaySamples)
     stereoDelayR = [Double](repeating: 0, count: Self.butterworthDryDelaySamples)
-    apply(configuration: configuration)
+    rebuildLFE()
+    apply(realtimeConfiguration: configuration)
   }
 
+  /// Legacy control-side API; Array-to-POD conversion stays off the audio thread.
   mutating func apply(configuration: Configuration) {
+    apply(realtimeConfiguration: RealtimeConfiguration(configuration))
+  }
+
+  mutating func apply(realtimeConfiguration configuration: RealtimeConfiguration) {
+    let resetHistory =
+      self.configuration.lfeLowpass != configuration.lfeLowpass
+      || self.configuration.channelMap != configuration.channelMap
+      || self.configuration.inputChannelCount != configuration.inputChannelCount
     self.configuration = configuration
     masterGain = pow(10.0, configuration.preampDb / 20.0)
-    rebuildLFE()
-    stereoDelayL = [Double](repeating: 0, count: Self.butterworthDryDelaySamples)
-    stereoDelayR = [Double](repeating: 0, count: Self.butterworthDryDelaySamples)
-    dryDelayIndex = 0
+    if resetHistory {
+      lfeFilterA.reset()
+      lfeFilterB.reset()
+      for index in stereoDelayL.indices {
+        stereoDelayL[index] = 0
+        stereoDelayR[index] = 0
+      }
+      dryDelayIndex = 0
+    }
   }
 
+  /// Legacy control/test API. The allocating conversion must not run in a callback.
   mutating func takeMeterSnapshot() -> MeterSnapshot {
-    let snapshot = MeterSnapshot(
-      inputPeaksDb: inputPeaks.map(Self.db(fromLinear:)),
-      outputPeakLDb: Self.db(fromLinear: outputPeakL),
-      outputPeakRDb: Self.db(fromLinear: outputPeakR),
+    takeRealtimeMeterSnapshot().snapshot
+  }
+
+  /// Callback-safe capture and decay: fixed-size linear peaks, no Array allocation.
+  mutating func takeRealtimeMeterSnapshot() -> RealtimeMeterSnapshot {
+    let snapshot = RealtimeMeterSnapshot(
+      inputPeaks: inputPeaks,
+      outputPeakL: outputPeakL,
+      outputPeakR: outputPeakR,
       clipL: clipL,
       clipR: clipR
     )
-    for i in inputPeaks.indices { inputPeaks[i] *= 0.6 }
+    for i in 0..<16 { inputPeaks[i] *= 0.6 }
     outputPeakL *= 0.6
     outputPeakR *= 0.6
     clipL = false
@@ -68,6 +117,13 @@ struct DownmixProcessor: Sendable {
     output: UnsafeMutablePointer<Float>,
     frameCount: Int
   ) {
+    guard frameCount > 0, frameCount <= Int.max / 2 else { return }
+    guard inputChannelCount > 0 else {
+      output.update(repeating: 0, count: frameCount * 2)
+      return
+    }
+    guard inputChannelCount <= Int.max / frameCount else { return }
+
     let map = configuration.channelMap
     let useLFEFilter = configuration.lfeLowpass
     let swap = configuration.swapOutputs
@@ -190,15 +246,16 @@ struct DownmixProcessor: Sendable {
     input: UnsafePointer<Float>,
     frameOffset: Int,
     inputChannelCount: Int,
-    map: [Int],
+    map: SIMD16<Int32>,
     slot: Int
   ) -> Double {
-    guard slot < map.count else { return 0 }
-    let deviceChannel = map[slot]
+    let deviceChannel = Int(map[slot])
     guard deviceChannel > 0 else { return 0 }
     let index = deviceChannel - 1
     guard index < inputChannelCount else { return 0 }
     let sample = input[frameOffset + index]
+    // Sanitize before metering and filtering so a bad sample cannot poison history.
+    guard sample.isFinite else { return 0 }
     let magnitude = abs(sample)
     if magnitude > inputPeaks[slot] {
       inputPeaks[slot] = magnitude
@@ -213,6 +270,34 @@ struct DownmixProcessor: Sendable {
     lfeFilterB.coefficients = BiquadDesign.lowPass(freq: f, q: 1.3065629648763766, sampleRate: sr)
     lfeFilterA.reset()
     lfeFilterB.reset()
+  }
+}
+
+/// POD mailbox payload. Peaks are linear so dB conversion also stays off callbacks.
+struct RealtimeMeterSnapshot: BitwiseCopyable, Sendable, Equatable {
+  var inputPeaks: SIMD16<Float>
+  var outputPeakL: Float
+  var outputPeakR: Float
+  var clipL: Bool
+  var clipR: Bool
+
+  static let empty = RealtimeMeterSnapshot(
+    inputPeaks: SIMD16<Float>(repeating: 0),
+    outputPeakL: 0,
+    outputPeakR: 0,
+    clipL: false,
+    clipR: false
+  )
+
+  /// Main/control thread only: allocates the existing UI meter Array.
+  var snapshot: MeterSnapshot {
+    MeterSnapshot(
+      inputPeaksDb: (0..<16).map { Self.db(fromLinear: inputPeaks[$0]) },
+      outputPeakLDb: Self.db(fromLinear: outputPeakL),
+      outputPeakRDb: Self.db(fromLinear: outputPeakR),
+      clipL: clipL,
+      clipR: clipR
+    )
   }
 
   private static func db(fromLinear value: Float) -> Float {

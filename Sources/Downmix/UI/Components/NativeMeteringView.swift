@@ -30,7 +30,9 @@ final class DownmixMeterNSView: NSView {
 
     mutating func reset(to db: Float, now: TimeInterval) {
       self.db = DownmixMeterNSView.sanitized(db)
-      holdUntil = now + DownmixMeterNSView.peakHoldDuration
+      holdUntil =
+        self.db <= DownmixMeterNSView.minimumDB
+        ? 0 : now + DownmixMeterNSView.peakHoldDuration
     }
 
     mutating func update(sample: Float, now: TimeInterval, deltaTime: TimeInterval) {
@@ -53,10 +55,12 @@ final class DownmixMeterNSView: NSView {
   private static let peakReleaseDBPerSecond: Float = 30
   private static let standardFrameInterval: TimeInterval = 1.0 / 30.0
   private static let reducedMotionFrameInterval: TimeInterval = 0.1
+  private static let settledToleranceDB: Float = 0.01
 
   private(set) var source: MeterSource
   private var targetSnapshot: MeterSnapshot
   private var displayedSnapshot: MeterSnapshot
+  private var lastResetRevision: UInt64
   private var bedPeakHolds = [PeakHold](
     repeating: PeakHold(),
     count: BedChannel.allCases.count
@@ -68,16 +72,27 @@ final class DownmixMeterNSView: NSView {
   private var observing = false
   private var shouldReduceMotion: Bool
   private weak var observedWindow: NSWindow?
+  private let currentTime: () -> TimeInterval
+
+  #if METERING_CHECKS
+    private var meteringCheckVisibility: Bool?
+    private(set) var meteringCheckFrameCount = 0
+  #endif
 
   override var isFlipped: Bool { true }
   override var isOpaque: Bool { true }
 
-  init(source: MeterSource) {
+  init(
+    source: MeterSource,
+    currentTime: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
+  ) {
     let snapshot = source.snapshot()
+    self.currentTime = currentTime
     self.source = source
     targetSnapshot = snapshot
     displayedSnapshot = snapshot
-    lastFrameTime = ProcessInfo.processInfo.systemUptime
+    lastResetRevision = source.resetRevision()
+    lastFrameTime = currentTime()
     shouldReduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
     super.init(frame: .zero)
 
@@ -131,6 +146,7 @@ final class DownmixMeterNSView: NSView {
     }
 
     source = newSource
+    lastResetRevision = newSource.resetRevision()
     let snapshot = newSource.snapshot()
     targetSnapshot = snapshot
     resetBallistics(to: snapshot)
@@ -139,6 +155,7 @@ final class DownmixMeterNSView: NSView {
     if observing {
       observeMeterSource()
     }
+    updateAnimationTimerActivity()
     needsDisplay = true
   }
 
@@ -209,21 +226,43 @@ final class DownmixMeterNSView: NSView {
   private func observeMeterSource() {
     NotificationCenter.default.addObserver(
       self,
-      selector: #selector(meterSourceDidChange),
+      selector: #selector(meterSourceDidChange(_:)),
       name: .downmixMetersDidChange,
       object: source
     )
   }
 
-  @objc private func meterSourceDidChange() {
-    targetSnapshot = source.snapshot()
+  @objc private func meterSourceDidChange(_ notification: Notification) {
+    receiveSourceSnapshot()
+    updateAnimationTimerActivity()
+  }
+
+  private func receiveSourceSnapshot() {
+    // A durable generation also catches Stop/error while the view was unobserved.
+    // Ordinary running silence changes the snapshot but never this reset generation.
+    let resetRevision = source.resetRevision()
+    let resetDisplay = resetRevision != lastResetRevision
+    lastResetRevision = resetRevision
+    receiveSnapshot(source.snapshot(), resetDisplay: resetDisplay)
+  }
+
+  private func receiveSnapshot(_ snapshot: MeterSnapshot, resetDisplay: Bool = false) {
+    if !resetDisplay, snapshot != targetSnapshot {
+      // A settled target remained current while its timer slept. Account for
+      // that sample up to this transition, preserving a full hold after a
+      // sustained peak drops without running idle repaint callbacks.
+      updatePeakHolds(now: currentTime(), deltaTime: 0)
+    }
+    targetSnapshot = snapshot
+    if resetDisplay {
+      // Clear levels, holds AND clip flags synchronously, even without a timer.
+      resetBallistics(to: .empty)
+      needsDisplay = true
+    } else if shouldReduceMotion {
+      displayedSnapshot = Self.sanitizedSnapshot(snapshot)
+      needsDisplay = true
+    }
     updateAccessibilityValue()
-    if shouldReduceMotion {
-      displayedSnapshot = targetSnapshot
-    }
-    if animationTimer == nil {
-      resetBallistics(to: targetSnapshot)
-    }
   }
 
   @objc private func accessibilityDisplayOptionsDidChange() {
@@ -231,7 +270,7 @@ final class DownmixMeterNSView: NSView {
     guard reduceMotion != shouldReduceMotion else { return }
     shouldReduceMotion = reduceMotion
     if reduceMotion {
-      displayedSnapshot = targetSnapshot
+      displayedSnapshot = Self.sanitizedSnapshot(targetSnapshot)
     }
     updateAnimationTimerActivity(forceRestart: true)
     needsDisplay = true
@@ -279,7 +318,15 @@ final class DownmixMeterNSView: NSView {
     guard observing, isWindowVisibleForMetering else {
       animationTimer?.invalidate()
       animationTimer = nil
-      resetBallistics(to: source.snapshot())
+      return
+    }
+
+    // Refresh on window/start wake as well as notifications. Do not discard
+    // release/hold history just because the timer was asleep during silence.
+    receiveSourceSnapshot()
+    guard hasPendingAnimation else {
+      animationTimer?.invalidate()
+      animationTimer = nil
       return
     }
 
@@ -288,6 +335,9 @@ final class DownmixMeterNSView: NSView {
   }
 
   private var isWindowVisibleForMetering: Bool {
+    #if METERING_CHECKS
+      if let meteringCheckVisibility { return meteringCheckVisibility }
+    #endif
     guard let window, window.isVisible, !window.isMiniaturized else { return false }
     return window.occlusionState.contains(.visible)
   }
@@ -307,15 +357,17 @@ final class DownmixMeterNSView: NSView {
     timer.tolerance = interval * 0.12
     RunLoop.main.add(timer, forMode: .common)
     animationTimer = timer
-    lastFrameTime = ProcessInfo.processInfo.systemUptime
+    lastFrameTime = currentTime()
   }
 
   private func advanceAnimation() {
-    // Sampling here as well as in the notification callback makes source
-    // replacement and a coalesced/missed notification harmless.
-    targetSnapshot = source.snapshot()
+    #if METERING_CHECKS
+      meteringCheckFrameCount += 1
+    #endif
+    // Sampling here also catches level changes coalesced between frames.
+    receiveSourceSnapshot()
 
-    let now = ProcessInfo.processInfo.systemUptime
+    let now = currentTime()
     let deltaTime = min(0.1, max(0, now - lastFrameTime))
     lastFrameTime = now
 
@@ -325,12 +377,58 @@ final class DownmixMeterNSView: NSView {
     }
 
     if shouldReduceMotion {
-      displayedSnapshot = targetSnapshot
+      displayedSnapshot = Self.sanitizedSnapshot(targetSnapshot)
     } else {
       interpolateDisplayedLevels(deltaTime: deltaTime)
     }
     updatePeakHolds(now: now, deltaTime: deltaTime)
+    settleBallistics()
     needsDisplay = true
+    updateAnimationTimerActivity()
+  }
+
+  /// Include the numeric stereo readout, which remains visible below -60 dB.
+  private var hasPendingAnimation: Bool {
+    for index in bedPeakHolds.indices {
+      let target = bedTarget(at: index)
+      let displayed =
+        index < displayedSnapshot.inputPeaksDb.count
+        ? displayedSnapshot.inputPeaksDb[index] : Self.minimumDB
+      if displayed != target || bedPeakHolds[index].db != target { return true }
+    }
+    return displayedSnapshot.outputPeakLDb != Self.sanitized(targetSnapshot.outputPeakLDb)
+      || displayedSnapshot.outputPeakRDb != Self.sanitized(targetSnapshot.outputPeakRDb)
+      || leftPeakHold.db != Self.sanitized(targetSnapshot.outputPeakLDb)
+      || rightPeakHold.db != Self.sanitized(targetSnapshot.outputPeakRDb)
+      || displayedSnapshot.clipL != targetSnapshot.clipL
+      || displayedSnapshot.clipR != targetSnapshot.clipR
+  }
+
+  private func bedTarget(at index: Int) -> Float {
+    Self.sanitized(
+      index < targetSnapshot.inputPeaksDb.count
+        ? targetSnapshot.inputPeaksDb[index] : Self.minimumDB)
+  }
+
+  /// Exponential release never reaches its target exactly. Snap sub-readout
+  /// differences only, allowing finite settlement without losing peak history.
+  private func settleBallistics() {
+    func settled(_ value: Float, target: Float) -> Float {
+      let target = Self.sanitized(target)
+      return abs(value - target) <= Self.settledToleranceDB ? target : value
+    }
+    for index in bedPeakHolds.indices {
+      let target = bedTarget(at: index)
+      displayedSnapshot.inputPeaksDb[index] = settled(
+        displayedSnapshot.inputPeaksDb[index], target: target)
+      bedPeakHolds[index].db = settled(bedPeakHolds[index].db, target: target)
+    }
+    displayedSnapshot.outputPeakLDb = settled(
+      displayedSnapshot.outputPeakLDb, target: targetSnapshot.outputPeakLDb)
+    displayedSnapshot.outputPeakRDb = settled(
+      displayedSnapshot.outputPeakRDb, target: targetSnapshot.outputPeakRDb)
+    leftPeakHold.db = settled(leftPeakHold.db, target: targetSnapshot.outputPeakLDb)
+    rightPeakHold.db = settled(rightPeakHold.db, target: targetSnapshot.outputPeakRDb)
   }
 
   private func interpolateDisplayedLevels(deltaTime: TimeInterval) {
@@ -398,31 +496,54 @@ final class DownmixMeterNSView: NSView {
     )
   }
 
-  private func resetBallistics(
-    to snapshot: MeterSnapshot,
-    now: TimeInterval = ProcessInfo.processInfo.systemUptime
-  ) {
-    let channelCount = BedChannel.allCases.count
-    var levels = [Float](repeating: Self.minimumDB, count: channelCount)
+  private static func sanitizedSnapshot(_ snapshot: MeterSnapshot) -> MeterSnapshot {
+    var levels = [Float](repeating: minimumDB, count: BedChannel.allCases.count)
     for index in levels.indices where index < snapshot.inputPeaksDb.count {
-      levels[index] = Self.sanitized(snapshot.inputPeaksDb[index])
+      levels[index] = sanitized(snapshot.inputPeaksDb[index])
     }
-
-    displayedSnapshot = MeterSnapshot(
+    return MeterSnapshot(
       inputPeaksDb: levels,
-      outputPeakLDb: Self.sanitized(snapshot.outputPeakLDb),
-      outputPeakRDb: Self.sanitized(snapshot.outputPeakRDb),
+      outputPeakLDb: sanitized(snapshot.outputPeakLDb),
+      outputPeakRDb: sanitized(snapshot.outputPeakRDb),
       clipL: snapshot.clipL,
-      clipR: snapshot.clipR
-    )
+      clipR: snapshot.clipR)
+  }
+
+  private func resetBallistics(to snapshot: MeterSnapshot) {
+    let now = currentTime()
+    displayedSnapshot = Self.sanitizedSnapshot(snapshot)
     targetSnapshot = snapshot
 
     for index in bedPeakHolds.indices {
-      bedPeakHolds[index].reset(to: levels[index], now: now)
+      bedPeakHolds[index].reset(to: displayedSnapshot.inputPeaksDb[index], now: now)
     }
     leftPeakHold.reset(to: snapshot.outputPeakLDb, now: now)
     rightPeakHold.reset(to: snapshot.outputPeakRDb, now: now)
   }
+
+  #if METERING_CHECKS
+    // Exercise actual native state and Timer lifecycle without depending on
+    // WindowServer occlusion or wall-clock sleeps. Absent from app builds.
+    var meteringCheckDisplayed: MeterSnapshot { displayedSnapshot }
+    var meteringCheckHeldLevels: [Float] {
+      bedPeakHolds.map(\.db) + [leftPeakHold.db, rightPeakHold.db]
+    }
+    var meteringCheckHoldDeadlines: [TimeInterval] {
+      bedPeakHolds.map(\.holdUntil) + [leftPeakHold.holdUntil, rightPeakHold.holdUntil]
+    }
+    var meteringCheckTimer: Timer? { animationTimer }
+
+    func meteringCheckSetVisible(_ visible: Bool) {
+      meteringCheckVisibility = visible
+      updateAnimationTimerActivity()
+    }
+
+    func meteringCheckSetReducedMotion(_ reduced: Bool) {
+      shouldReduceMotion = reduced
+      receiveSnapshot(source.snapshot())
+      updateAnimationTimerActivity(forceRestart: true)
+    }
+  #endif
 
   private static func sanitized(_ db: Float) -> Float {
     guard db.isFinite else { return minimumDB }

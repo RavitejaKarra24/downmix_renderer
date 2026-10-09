@@ -25,10 +25,21 @@ if [[ ${#ARCH_LIST[@]} -eq 0 ]]; then
   ARCH_LIST=("$HOST_ARCH")
 fi
 
+SOURCE_DIGEST="$("$ROOT/Scripts/source_digest.sh")"
+
+# Keep architecture products separate and ask SwiftPM for their actual location.
+# Swift 6.4's Swift Build backend no longer uses the old .build/<triple> layout.
+BUILD_DIRS=()
 for ARCH in "${ARCH_LIST[@]}"; do
-  swift build -c "$CONF" --arch "$ARCH"
+  SCRATCH_PATH="$ROOT/.build/package-$ARCH"
+  swift build -c "$CONF" --arch "$ARCH" --scratch-path "$SCRATCH_PATH"
+  BUILD_DIRS+=("$(swift build -c "$CONF" --arch "$ARCH" --scratch-path "$SCRATCH_PATH" --show-bin-path)")
 done
 
+[[ "$("$ROOT/Scripts/source_digest.sh")" == "$SOURCE_DIGEST" ]] || {
+  echo 'ERROR: Build inputs changed during compilation; retry packaging an unchanged tree.' >&2
+  exit 1
+}
 APP="$ROOT/${APP_NAME}.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Frameworks"
@@ -68,6 +79,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>LSApplicationCategoryType</key><string>public.app-category.music</string>
     <key>BuildTimestamp</key><string>${BUILD_TIMESTAMP}</string>
     <key>GitCommit</key><string>${GIT_COMMIT}</string>
+    <key>SourceDigest</key><string>${SOURCE_DIGEST}</string>
 </dict>
 </plist>
 PLIST
@@ -75,10 +87,15 @@ PLIST
 build_product_path() {
   local name="$1"
   local arch="$2"
-  case "$arch" in
-    arm64|x86_64) echo ".build/${arch}-apple-macosx/$CONF/$name" ;;
-    *) echo ".build/$CONF/$name" ;;
-  esac
+  local index
+  for index in "${!ARCH_LIST[@]}"; do
+    if [[ "${ARCH_LIST[$index]}" == "$arch" ]]; then
+      echo "${BUILD_DIRS[$index]}/$name"
+      return
+    fi
+  done
+  echo "ERROR: Unknown build architecture $arch" >&2
+  return 1
 }
 
 verify_binary_arches() {
@@ -143,7 +160,7 @@ if [[ ${#SWIFTPM_BUNDLES[@]} -gt 0 ]]; then
 fi
 
 # Embed frameworks if any exist in the build folder.
-FRAMEWORK_DIRS=(".build/$CONF" ".build/${ARCH_LIST[0]}-apple-macosx/$CONF")
+FRAMEWORK_DIRS=("${BUILD_DIRS[0]}")
 for dir in "${FRAMEWORK_DIRS[@]}"; do
   if compgen -G "${dir}/*.framework" >/dev/null; then
     cp -R "${dir}/"*.framework "$APP/Contents/Frameworks/"

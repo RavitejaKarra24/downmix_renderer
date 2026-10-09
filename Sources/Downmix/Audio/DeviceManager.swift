@@ -21,32 +21,43 @@ enum DeviceManager {
   }
 
   static func isSafeOutputRoute(_ device: AudioDeviceInfo, inputUID: String) -> Bool {
-    !routeContainsDevice(
-      deviceID: device.id,
-      matchingUID: inputUID,
-      rejectsBlackHole: true,
-      visited: []
-    )
+    let inputID: AudioDeviceID?
+    if inputUID.isEmpty {
+      inputID = nil
+    } else {
+      guard let resolved = deviceID(uid: inputUID) else { return false }
+      inputID = resolved
+    }
+    return isSafeRoute(outputID: device.id, inputID: inputID, readNode: routeNode)
   }
 
-  static func preferredInput(matchingName name: String?, uid: String?) -> AudioDeviceInfo? {
-    let devices = inputDevices()
-    if let uid, let match = devices.first(where: { $0.uid == uid }) { return match }
-    if let name, let match = devices.first(where: { namesMatch($0.name, name) }) { return match }
+  static func preferredInput(
+    matchingName name: String?, uid: String?, devices catalog: [AudioDeviceInfo]? = nil
+  ) -> AudioDeviceInfo? {
+    let devices = (catalog ?? allDevices()).filter(\.isInputCapable)
+    if let uid, !uid.isEmpty { return devices.first(where: { $0.uid == uid }) }
+    if let name, !name.isEmpty {
+      return devices.first(where: { namesMatch($0.name, name) })
+    }
     return devices.first(where: {
       $0.name.localizedCaseInsensitiveContains("blackhole") && $0.inputChannelCount >= 16
     })
       ?? devices.first(where: { $0.inputChannelCount >= 16 })
   }
 
-  static func preferredOutput(matchingName name: String?, uid: String?) -> AudioDeviceInfo? {
-    let devices = outputDevices()
-    if let uid, let match = devices.first(where: { $0.uid == uid }) { return match }
-    if let name, let match = devices.first(where: { namesMatch($0.name, name) }) { return match }
+  static func preferredOutput(
+    matchingName name: String?, uid: String?, devices catalog: [AudioDeviceInfo]? = nil,
+    routeSafety: (AudioDeviceInfo, String) -> Bool = isSafeOutputRoute
+  ) -> AudioDeviceInfo? {
+    let devices = (catalog ?? allDevices()).filter(\.isOutputCapable)
+    if let uid, !uid.isEmpty { return devices.first(where: { $0.uid == uid }) }
+    if let name, !name.isEmpty {
+      return devices.first(where: { namesMatch($0.name, name) })
+    }
     return devices.first(where: {
-      $0.outputChannelCount == 2 && !$0.name.localizedCaseInsensitiveContains("blackhole")
+      $0.outputChannelCount == 2 && routeSafety($0, "")
     })
-      ?? devices.first(where: { $0.outputChannelCount >= 2 })
+      ?? devices.first(where: { $0.outputChannelCount >= 2 && routeSafety($0, "") })
   }
 
   private static func namesMatch(_ a: String, _ b: String) -> Bool {
@@ -59,6 +70,27 @@ enum DeviceManager {
       .replacingOccurrences(of: #"\s*\(unavailable\)\s*$"#, with: "", options: .regularExpression)
       .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
       .trimmingCharacters(in: .whitespacesAndNewlines)
+  }
+
+  private static func deviceID(uid: String) -> AudioDeviceID? {
+    // UID translation avoids enumerating the full device list for every safety
+    // certificate and every watchdog tick. The qualifier is a CFString pointer.
+    var address = AudioObjectPropertyAddress(
+      mSelector: kAudioHardwarePropertyTranslateUIDToDevice,
+      mScope: kAudioObjectPropertyScopeGlobal,
+      mElement: kAudioObjectPropertyElementMain)
+    var qualifier = uid as CFString
+    var id = AudioDeviceID(kAudioObjectUnknown)
+    var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+    let result = withUnsafePointer(to: &qualifier) { pointer in
+      AudioObjectGetPropertyData(
+        AudioObjectID(kAudioObjectSystemObject), &address,
+        UInt32(MemoryLayout<CFString>.size), pointer, &size, &id)
+    }
+    guard result == noErr, size == MemoryLayout<AudioDeviceID>.size,
+      id != kAudioObjectUnknown
+    else { return nil }
+    return id
   }
 
   private static func deviceIDs() -> [AudioDeviceID] {
@@ -102,38 +134,77 @@ enum DeviceManager {
     )
   }
 
-  private static func routeContainsDevice(
-    deviceID: AudioDeviceID,
-    matchingUID inputUID: String,
-    rejectsBlackHole: Bool,
-    visited: Set<AudioDeviceID>
-  ) -> Bool {
-    guard !visited.contains(deviceID) else { return false }
-    var visited = visited
-    visited.insert(deviceID)
+  struct RouteNode {
+    let uid: String
+    let name: String
+    let children: [AudioDeviceID]
+  }
 
-    let uid = stringProperty(id: deviceID, selector: kAudioDevicePropertyDeviceUID) ?? ""
-    let name = stringProperty(id: deviceID, selector: kAudioObjectPropertyName) ?? ""
-    if uid == inputUID
-      || (rejectsBlackHole
-        && (uid.localizedCaseInsensitiveContains("blackhole")
-          || name.localizedCaseInsensitiveContains("blackhole")))
+  /// Resolve BOTH graphs, including roots and intermediate aggregates. A nil node,
+  /// empty identity or cycle cannot certify safety. Shared DAG children are not cycles.
+  static func isSafeRoute(
+    outputID: AudioDeviceID, inputID: AudioDeviceID?,
+    readNode: (AudioDeviceID) -> RouteNode?
+  ) -> Bool {
+    func resolve(_ id: AudioDeviceID, path: Set<AudioDeviceID>, rejectBlackHole: Bool)
+      -> (ids: Set<AudioDeviceID>, uids: Set<String>)?
     {
-      return true
+      guard path.count < 256, !path.contains(id), let node = readNode(id), !node.uid.isEmpty,
+        !node.name.isEmpty
+      else { return nil }
+      if rejectBlackHole,
+        node.uid.localizedCaseInsensitiveContains("blackhole")
+          || node.name.localizedCaseInsensitiveContains("blackhole")
+      {
+        return nil
+      }
+      var ids: Set<AudioDeviceID> = [id]
+      var uids: Set<String> = [node.uid]
+      for child in node.children {
+        guard
+          let graph = resolve(
+            child, path: path.union([id]), rejectBlackHole: rejectBlackHole)
+        else { return nil }
+        ids.formUnion(graph.ids)
+        uids.formUnion(graph.uids)
+      }
+      return (ids, uids)
     }
+    guard let output = resolve(outputID, path: [], rejectBlackHole: true) else { return false }
+    guard let inputID else { return true }
+    guard let input = resolve(inputID, path: [], rejectBlackHole: false) else { return false }
+    return output.ids.isDisjoint(with: input.ids) && output.uids.isDisjoint(with: input.uids)
+  }
+
+  private static func routeNode(deviceID: AudioDeviceID) -> RouteNode? {
+    guard let uid = stringProperty(id: deviceID, selector: kAudioDevicePropertyDeviceUID),
+      let name = stringProperty(id: deviceID, selector: kAudioObjectPropertyName)
+    else { return nil }
 
     var property = AudioObjectPropertyAddress(
       mSelector: kAudioAggregateDevicePropertyActiveSubDeviceList,
       mScope: kAudioObjectPropertyScopeGlobal,
       mElement: kAudioObjectPropertyElementMain
     )
-    guard AudioObjectHasProperty(deviceID, &property) else { return false }
+    guard AudioObjectHasProperty(deviceID, &property) else {
+      // An aggregate with an unavailable subdevice property is not a known leaf.
+      var classAddress = property
+      classAddress.mSelector = kAudioObjectPropertyClass
+      var objectClass: AudioClassID = 0
+      var size = UInt32(MemoryLayout<AudioClassID>.size)
+      guard
+        AudioObjectGetPropertyData(deviceID, &classAddress, 0, nil, &size, &objectClass)
+          == noErr, size == MemoryLayout<AudioClassID>.size,
+        objectClass != kAudioAggregateDeviceClassID
+      else { return nil }
+      return RouteNode(uid: uid, name: name, children: [])
+    }
 
     var dataSize: UInt32 = 0
     guard AudioObjectGetPropertyDataSize(deviceID, &property, 0, nil, &dataSize) == noErr,
-      dataSize > 0
+      dataSize > 0, Int(dataSize).isMultiple(of: MemoryLayout<AudioDeviceID>.size)
     else {
-      return false
+      return nil
     }
     let count = Int(dataSize) / MemoryLayout<AudioDeviceID>.size
     var subdeviceIDs = [AudioDeviceID](repeating: 0, count: count)
@@ -147,16 +218,10 @@ enum DeviceManager {
         &subdeviceIDs
       ) == noErr
     else {
-      return false
+      return nil
     }
-    return subdeviceIDs.contains {
-      routeContainsDevice(
-        deviceID: $0,
-        matchingUID: inputUID,
-        rejectsBlackHole: rejectsBlackHole,
-        visited: visited
-      )
-    }
+    guard Int(dataSize) == count * MemoryLayout<AudioDeviceID>.size else { return nil }
+    return RouteNode(uid: uid, name: name, children: subdeviceIDs)
   }
 
   private static func stringProperty(id: AudioDeviceID, selector: AudioObjectPropertySelector)
@@ -186,7 +251,7 @@ enum DeviceManager {
     return nil
   }
 
-  private static func channelCount(id: AudioDeviceID, scope: AudioObjectPropertyScope) -> Int {
+  static func channelCount(id: AudioDeviceID, scope: AudioObjectPropertyScope) -> Int {
     var property = AudioObjectPropertyAddress(
       mSelector: kAudioDevicePropertyStreamConfiguration,
       mScope: scope,
@@ -200,10 +265,16 @@ enum DeviceManager {
     let raw = UnsafeMutableRawPointer.allocate(
       byteCount: Int(dataSize), alignment: MemoryLayout<AudioBufferList>.alignment)
     defer { raw.deallocate() }
-    guard AudioObjectGetPropertyData(id, &property, 0, nil, &dataSize, raw) == noErr else {
-      return 0
-    }
+    let capacity = Int(dataSize)
+    let headerSize = MemoryLayout<AudioBufferList>.offset(of: \.mBuffers)!
+    guard AudioObjectGetPropertyData(id, &property, 0, nil, &dataSize, raw) == noErr,
+      Int(dataSize) <= capacity, Int(dataSize) >= headerSize
+    else { return 0 }
     let bufferList = raw.bindMemory(to: AudioBufferList.self, capacity: 1)
+    guard
+      Int(bufferList.pointee.mNumberBuffers)
+        <= (Int(dataSize) - headerSize) / MemoryLayout<AudioBuffer>.stride
+    else { return 0 }
     let buffers = UnsafeMutableAudioBufferListPointer(bufferList)
     var total = 0
     for buffer in buffers {

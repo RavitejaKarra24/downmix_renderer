@@ -206,6 +206,7 @@ extension View {
 
 struct SecondaryButtonStyle: ButtonStyle {
   @Environment(\.isEnabled) private var isEnabled
+  @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
   func makeBody(configuration: Configuration) -> some View {
     configuration.label
@@ -223,7 +224,7 @@ struct SecondaryButtonStyle: ButtonStyle {
       .overlay(Capsule().stroke(DownmixTheme.cardStroke, lineWidth: 1))
       .foregroundStyle(isEnabled ? DownmixTheme.textPrimary : DownmixTheme.textSecondary)
       .opacity(isEnabled ? 1 : 0.55)
-      .scaleEffect(configuration.isPressed ? 0.97 : 1)
-      .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
+      .scaleEffect(configuration.isPressed && !reduceMotion ? 0.97 : 1)
+      .animation(reduceMotion ? nil : .easeOut(duration: 0.12), value: configuration.isPressed)
   }
 }
