@@ -1,4 +1,12 @@
-# Native UI and accessibility release checks
+# Native UI validation
+
+## Current scope
+
+See [`../todo.md`](../todo.md). New accessibility features and dedicated manual
+accessibility qualification are stopped by owner request. Existing AX identifiers
+and native actions remain useful for testing ordinary controls without real audio
+or external automation permissions; they are not an accessibility certification.
+The historical fixture coverage below is retained, not expanded.
 
 ## Automated commands
 
@@ -39,7 +47,9 @@ It does not turn on VoiceOver, request trust, or change system preferences. This
 fixture-only runtime/SDK dependency must fail visibly if a future OS stops supporting it.
 Controls are looked up by stable identifiers, with roles, labels and values checked.
 Actions use `accessibilityPerformPress` for SwiftUI virtual buttons and native
-`NSControl.performClick` for AppKit buttons/switches, plus native slider increment.
+`NSControl.performClick` for AppKit buttons/switches, plus native slider increment. Slider success is verified from its resulting preference
+change, not its Boolean action acknowledgement; native controls may dispatch while
+returning false. A missing binding change still fails the test.
 A native NSSwitch on this OS can execute AX press while returning false; the
 fixture does not retry that false result and inadvertently toggle twice. Toolbar
 tab segments can likewise dispatch while returning false; they are pressed once
@@ -134,12 +144,14 @@ The full rendered suite reports **11 groups: 1 deterministic favorite-ordering a
 `Scripts/check_metering.sh` separately tests actual native meter reset/ballistics/settled
 Timer behavior in debug and optimized builds; see `Checks/Metering/README.md`.
 
-## Manual release gate (still required)
+## Manual functional checks and optional accessibility reference
 
 Use the packaged real app with deliberate user-selected devices and permissions.
-Do not interpret these checks as complete VoiceOver certification.
+Items 2, 4 and 6 remain functional release checks. Items 1, 3 and 5 are retained
+only as optional reference: their accessibility-specific qualification is stopped,
+not required by the current scope. No VoiceOver certification is claimed.
 
-1. **Keyboard:** with keyboard navigation enabled, Tab/Shift-Tab through transport,
+1. **Optional keyboard accessibility reference:** with keyboard navigation enabled, Tab/Shift-Tab through transport,
    input/output rows, filter, preamp field/slider, layout popup, switches, Refresh,
    Setup and Advanced. Space/Return activates focused buttons; arrows operate
    sliders/pickers/steppers. Focus remains visible and can leave each control.
@@ -151,7 +163,7 @@ Do not interpret these checks as complete VoiceOver certification.
    Cmd-comma opens Settings; Escape closes the setup sheet; sheet focus returns
    to its invoking button. The fixture typechecks commands but does not simulate
    the SwiftUI App scene/global menu dispatch.
-3. **VoiceOver (enable manually):** verify readable control names, selected device
+3. **Optional VoiceOver reference (enable manually):** verify readable control names, selected device
    and switch states, status changes, errors/recovery, setup guidance and
    diagnostics. Traversal order should follow the visual hierarchy without
    decorative icons becoming extra stops. Check Settings tabs and popup choices,
@@ -161,7 +173,7 @@ Do not interpret these checks as complete VoiceOver certification.
 4. **Truthful setup:** automatic device/rate/permission checks may be Verified;
    speaker mapping and playback routing must remain Manual check, never green
    certification. Use system-tool buttons only when intentionally validating them.
-5. **Motion/appearance:** manually enable Reduce Motion and verify no decorative
+5. **Optional accessibility motion/appearance reference:** manually enable Reduce Motion and verify no decorative
    transport pulse/scale or menu icon running-state transition. Content and actions
    must be unchanged. Also inspect light/dark, Increase Contrast, larger text,
    minimum window size and scroll reachability. Restore preferences yourself.

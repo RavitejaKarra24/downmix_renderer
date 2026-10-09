@@ -41,8 +41,13 @@ SOURCES=(
 )
 assert_no_system_hal() {
   nm -u "$1" >"$CHECK_DIR/undefined-symbols.txt"
-  if rg '(_Audio(Object|Unit|OutputUnit|Component|Hardware))' "$CHECK_DIR/undefined-symbols.txt"; then
-    echo "FAIL: check executable links a real HAL API" >&2
+  # Use the macOS-supplied tool, not optional ripgrep. Any scanner error must
+  # fail closed before executing a fixture that could link real HAL calls.
+  if ! /usr/bin/awk '
+    /_Audio(Object|Unit|OutputUnit|Component|Hardware)/ { print; unsafe = 1 }
+    END { exit unsafe }
+  ' "$CHECK_DIR/undefined-symbols.txt"; then
+    echo "FAIL: real HAL API linked or symbol isolation could not be verified" >&2
     exit 1
   fi
 }

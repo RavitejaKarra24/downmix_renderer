@@ -4,13 +4,14 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 CHECK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/downmix-clock-drift.XXXXXX")"
 trap 'rm -rf "$CHECK_DIR"' EXIT
-FLAGS=()
+# Bash 3.2 treats an empty array as unset under nounset. Keep common flags here.
+FLAGS=(-swift-version 6)
 if [[ $# -gt 1 ]]; then
   echo "Usage: $0 [--tsan]" >&2
   exit 2
 fi
 if [[ "${1:-}" == "--tsan" ]]; then
-  FLAGS=(-sanitize=thread -g)
+  FLAGS+=(-sanitize=thread -g)
 elif [[ $# -gt 0 ]]; then
   echo "Usage: $0 [--tsan]" >&2
   exit 2
@@ -20,7 +21,7 @@ swift format lint --strict \
   Checks/ClockDrift/main.swift
 # Optimized standalone build: only the existing SPSC ring and the new core.
 # Long virtual tests step the real controller, not billions of FIR operations.
-swiftc -O -swift-version 6 -target "$(uname -m)-apple-macos15.0" "${FLAGS[@]}" \
+swiftc -O -target "$(uname -m)-apple-macos15.0" "${FLAGS[@]}" \
   Sources/Downmix/Audio/RingBuffer.swift \
   Sources/Downmix/Audio/AdaptiveStereoResampler.swift \
   Checks/ClockDrift/main.swift \

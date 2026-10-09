@@ -159,5 +159,11 @@ fixtures and remove them on exit; they do not use the GUI or user audio.
   timeout. No remote release/push, installation/launch of the real app, or secrets configuration.
 
 Hosted CI validates the committed tree, not collaborators' uncommitted work.
-The hosted runner/Xcode job must actually execute before claiming CI or sanitizer
-coverage on that environment. Neither CI nor self-tests measure live app CPU.
+The first inspected run, [37887832105](https://github.com/RavitejaKarra24/downmix_renderer/actions/runs/37887832105),
+failed: Bash 3.2 empty flag arrays skipped transport/clock checks, missing `rg`
+bypassed HAL symbol isolation, and the native preamp fixture failed on its action
+acknowledgement. Sanitizer steps were skipped. Local fixes use nonempty compiler
+flags, fail-closed system `awk` isolation and actual preamp binding-change validation;
+`Checks/Release/test_check_scripts.sh` covers shell failures with isolated fake tools.
+A fully passing hosted execution of the reviewed changes remains pending in
+[`../todo.md`](../todo.md). Neither CI nor self-tests measure live app CPU.

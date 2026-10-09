@@ -237,7 +237,8 @@ on another machine or a fresh user account.
 | `Checks/HAL/`, `Checks/Metering/`, `Checks/Release/` | Isolated actual-engine safety/lifetime, native meter/timer and failure-gated archive regressions |
 | `docs/profiling.md`, `docs/ui-validation.md` | Runtime profiling and automated/manual UI qualification |
 | `.github/workflows/check.yml` | Stable macOS lint/build/regression/sanitizer CI |
-| `future.md` | Prioritized engineering roadmap, implementation record, manual release gate |
+| `todo.md` | Active checklist: completed engineering, remaining qualification and stopped scope |
+| `future.md` | Original engineering plan and historical implementation/verification record |
 | `Scripts/` | Build, package, icon, and check scripts |
 | `version.env` | `CFBundleShortVersionString`, bundle ID, min OS |
 | `Downmix.zip` | The committed download artifact (see below) |
@@ -297,7 +298,7 @@ hardware-profiled; see [profiling instructions](docs/profiling.md) rather than a
 - Configuration/meters now use preallocated POD mailboxes instead of a shared DSP lock.
   Off-main setup/teardown and bounded independent-device clock correction are implemented.
   Runtime Instruments/CPU profiling and hardware qualification remain pending in
-  [future.md](future.md); all-day dropout-free playback is not yet certified.
+  [todo.md](todo.md); all-day dropout-free playback is not yet certified.
 - Changing devices or buffer size restarts the active route; a brief interruption is expected.
 - Requires BlackHole 16ch configured as 9.1.6; no other virtual device is detected specially.
 - No auto-update mechanism.

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Qualification of automatable requirements. Requires a logged-in macOS desktop.
-# Hardware/TCC, physical keyboard/VoiceOver and Instruments remain manual gates.
+# Hardware/TCC, native scene/shortcut dispatch and Instruments remain manual gates.
+# Dedicated accessibility qualification is outside the owner-requested scope.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"

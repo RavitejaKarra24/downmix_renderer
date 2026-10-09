@@ -343,7 +343,7 @@ private struct UIChecks {
         print("PASS native hosting/layout only; rendered AX/actions NOT run. Use --rendered.")
       }
       print(
-        "VoiceOver speech, focus order, physical keyboard and animation behavior require manual validation."
+        "Real native scenes/shortcuts remain manual; dedicated accessibility qualification is outside the current scope."
       )
     } catch {
       FileHandle.standardError.write(Data("UI checks FAILED/blocked: \(error)\n".utf8))
@@ -663,9 +663,14 @@ private struct UIChecks {
     try require(
       slider.accessibilityLabel() == "Preamp" && slider.accessibilityRole() == .slider,
       "Preamp AX semantics")
-    try require(slider.accessibilityPerformIncrement(), "Native preamp increment supported")
+    // Native controls can dispatch while returning false on older macOS.
+    // Press once and verify the actual binding change, not the acknowledgement.
+    let preampIncrementAcknowledged = slider.accessibilityPerformIncrement()
     hosted.settle()
-    try require(state.preferences.preampDb > original, "Rendered slider increment changes model")
+    try require(
+      state.preferences.preampDb > original,
+      "Rendered slider increment changes model (AX acknowledgement: \(preampIncrementAcknowledged))"
+    )
     try hosted.press("settings.swapOutputs")
     try require(state.preferences.swapOutputs, "Rendered swap toggle changes model")
     try require(

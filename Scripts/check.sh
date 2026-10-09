@@ -30,6 +30,7 @@ Scripts/check_async_control.sh
 Scripts/check_metering.sh
 bash Checks/Profiling/test_profile_cpu.sh
 bash Checks/Release/test_scripts.sh
+/bin/bash Checks/Release/test_check_scripts.sh
 bash Checks/Release/test_archive.sh
 swift build
 
