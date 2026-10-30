@@ -18,6 +18,9 @@ struct EngineStatus: Sendable, Equatable {
   var message: String = "Idle"
   var meters: MeterSnapshot = .empty
   var diagnostics: EngineDiagnostics = .empty
+  /// Bed layout advertisement for the input device of this run: `nil` when the run has
+  /// no 16-channel input, `false` when the HAL refused the layout change.
+  var bedLayoutInstalled: Bool?
 }
 
 /// Dual-device Core Audio engine: multi-channel input → DSP → stereo output.
@@ -122,6 +125,17 @@ final class AudioEngine: @unchecked Sendable {
       self.keepAliveOnly = keepAliveOnly
       self.inputChannels = max(configuration.inputChannelCount, 16)
       try validateDevices(inputDeviceID: inputDeviceID, outputDeviceID: outputDeviceID)
+      // Players downmix to stereo unless the input device advertises a layout their
+      // channel map can convert. Install it before IO opens so the next client stream
+      // negotiates the full bed. A refused layout is reported, never fatal.
+      status.bedLayoutInstalled =
+        keepAliveOnly
+        ? nil
+        : InputChannelLayout.installIfNeeded(
+          deviceID: inputDeviceID, channelCount: inputChannels)
+      if status.bedLayoutInstalled == false {
+        logger.warning("Input device refused the 9.1.6 bed layout; players may send stereo")
+      }
 
       // Do not retain a copied processor at startup: its delay arrays must be uniquely
       // owned before callbacks begin, otherwise the first write could trigger COW allocation.
@@ -753,6 +767,8 @@ final class AudioEngine: @unchecked Sendable {
     status.phase = phase
     status.message = message
     if let meters { status.meters = meters }
+    // The layout certificate belongs to one live run; anything else reports no claim.
+    if phase != .running && phase != .keepAlive { status.bedLayoutInstalled = nil }
     if phase == .running || phase == .keepAlive || phase == .error {
       status.diagnostics = diagnosticsSnapshot()
       // Failure counters remain inspectable, but stopped audio has no queued latency.

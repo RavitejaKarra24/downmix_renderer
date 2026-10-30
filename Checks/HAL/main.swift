@@ -346,12 +346,61 @@ func cleanupChecks() throws {
     "PASS: actual-engine failed setup/disposal, retained refCon and in-flight quiescence lifetime")
 }
 
+func bedLayoutChecks() throws {
+  stubHAL.reset()
+  let engine = try startEngine()
+  require(
+    engine.currentStatus.bedLayoutInstalled == true,
+    "Running engine certifies the installed bed layout")
+  for scope in [kAudioObjectPropertyScopeOutput, kAudioObjectPropertyScopeInput] {
+    require(
+      stubHAL.layouts[101]?[scope] == InputChannelLayout.bedLabels,
+      "Bed labels installed for scope \(scope)")
+  }
+  require(stubHAL.layoutWrites == 2, "One layout write per scope")
+  require(
+    InputChannelLayout.bedLabels.first == kAudioChannelLabel_Left
+      && InputChannelLayout.bedLabels[3] == kAudioChannelLabel_LFEScreen
+      && InputChannelLayout.bedLabels.count == 16,
+    "Bed label order matches the 9.1.6 processor order")
+  engine.stop()
+  require(engine.currentStatus.bedLayoutInstalled == nil, "Stopped run claims no layout")
+
+  stubHAL.devices[101]!.inputChannels = 16
+  stubHAL.layouts[101] = [
+    kAudioObjectPropertyScopeOutput: InputChannelLayout.bedLabels,
+    kAudioObjectPropertyScopeInput: InputChannelLayout.bedLabels,
+  ]
+  let compatible = try startEngine()
+  require(stubHAL.layoutWrites == 2, "A convertible layout is never rewritten")
+  require(compatible.currentStatus.bedLayoutInstalled == true, "Compatible layout verified")
+  compatible.stop()
+
+  stubHAL.reset()
+  stubHAL.devices[101]!.inputChannels = 32
+  let wide = try startEngine(channels: 32)
+  require(
+    wide.currentStatus.bedLayoutInstalled == nil && stubHAL.layoutWrites == 0,
+    "A non-16-channel input keeps its own layout and makes no claim")
+  wide.stop()
+
+  stubHAL.reset()
+  stubHAL.layoutWriteFailures = 4
+  let refused = try startEngine()
+  require(
+    refused.currentStatus.phase == .running && refused.currentStatus.bedLayoutInstalled == false,
+    "A refused layout never stops rendering")
+  refused.stop()
+  print("PASS: actual-engine bed layout install, idempotence, width and refusal reporting")
+}
+
 checkQueue.async {
   do {
     routeChecks()
     unsafeStartChecks()
     try watchdogChecks()
     try nilOutputChecks()
+    try bedLayoutChecks()
     try cleanupChecks()
     print("All isolated HAL checks passed (no hardware or system routes touched)")
     exit(0)

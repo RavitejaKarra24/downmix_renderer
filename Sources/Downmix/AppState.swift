@@ -254,11 +254,7 @@ final class AppState {
             : "Select or reconnect a stereo output. Avoid BlackHole and aggregates containing the input."
         ),
         permissionCheck,
-        SetupCheck(
-          id: .speakerMapping, title: "9.1.6 speaker mapping", status: .manual,
-          guidance:
-            "In Audio MIDI Setup, configure the input speakers as 9.1.6 and verify channel order against the selected bed layout. Downmix cannot verify this automatically."
-        ),
+        speakerMappingCheck(isRunning ? status.bedLayoutInstalled : nil),
         SetupCheck(
           id: .systemOutput, title: "Playback routed to input", status: .manual,
           guidance:
@@ -267,6 +263,31 @@ final class AppState {
       ],
       canRequestPermission: authorization == .notDetermined
     )
+  }
+
+  /// Players read the input's device layout to choose their output channel count. This
+  /// reports the layout installed for the live run, never a prompt-free manual claim.
+  private func speakerMappingCheck(_ installed: Bool?) -> SetupCheck {
+    switch installed {
+    case .some(true):
+      return SetupCheck(
+        id: .speakerMapping, title: "9.1.6 speaker mapping", status: .verified,
+        guidance:
+          "The input advertises the 9.1.6 bed layout. Reopen a file that was already playing so the player re-negotiates every channel."
+      )
+    case .some(false):
+      return SetupCheck(
+        id: .speakerMapping, title: "9.1.6 speaker mapping", status: .needsAttention,
+        guidance:
+          "Downmix could not set the input's 9.1.6 bed layout. Set it in Audio MIDI Setup → Configure Speakers, then start again."
+      )
+    case .none:
+      return SetupCheck(
+        id: .speakerMapping, title: "9.1.6 speaker mapping", status: .manual,
+        guidance:
+          "Downmix installs the 9.1.6 bed layout on the input when rendering starts, so players deliver every bed channel instead of stereo."
+      )
+    }
   }
 
   func refreshDevices() {

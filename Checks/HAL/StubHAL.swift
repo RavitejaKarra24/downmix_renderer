@@ -30,6 +30,12 @@ final class StubHAL: @unchecked Sendable {
   }
   var devices: [AudioDeviceID: Device] = [:]
   var units: [AudioComponentInstance: Unit] = [:]
+  /// Device preferred channel layouts as label lists, per scope. Absent means the
+  /// device reports a layout this width cannot describe.
+  var layouts: [AudioDeviceID: [AudioObjectPropertyScope: [AudioChannelLabel]]] = [:]
+  var layoutSettable = true
+  var layoutWriteFailures = 0
+  var layoutWrites = 0
   var disposalFailures = 0
   var initializeFailure: OSStatus = noErr
   var disposalProbe: (() -> Void)?
@@ -49,6 +55,10 @@ final class StubHAL: @unchecked Sendable {
     disposalProbe = nil
     stopProbe = nil
     disposalCount = 0
+    layouts = [:]
+    layoutSettable = true
+    layoutWriteFailures = 0
+    layoutWrites = 0
     renderHook.withLock { $0 = nil }
   }
 
@@ -182,8 +192,14 @@ func AudioObjectIsPropertySettable(
   _ id: AudioObjectID, _ address: UnsafePointer<AudioObjectPropertyAddress>,
   _ settable: UnsafeMutablePointer<DarwinBoolean>
 ) -> OSStatus {
-  precondition(address.pointee.mSelector == kAudioDevicePropertyBufferFrameSize)
-  settable.pointee = false
+  switch address.pointee.mSelector {
+  case kAudioDevicePropertyBufferFrameSize:
+    settable.pointee = false
+  case kAudioDevicePropertyPreferredChannelLayout:
+    settable.pointee = DarwinBoolean(stubHAL.layoutSettable)
+  default:
+    preconditionFailure("Unexpected settable query \(address.pointee.mSelector)")
+  }
   return noErr
 }
 
@@ -191,7 +207,26 @@ func AudioObjectIsPropertySettable(
 func AudioObjectSetPropertyData(
   _ id: AudioObjectID, _ address: UnsafePointer<AudioObjectPropertyAddress>,
   _ qualifierSize: UInt32, _ qualifier: UnsafeRawPointer?, _ size: UInt32, _ data: UnsafeRawPointer
-) -> OSStatus { preconditionFailure("Checks must not mutate device properties") }
+) -> OSStatus {
+  guard address.pointee.mSelector == kAudioDevicePropertyPreferredChannelLayout else {
+    preconditionFailure("Checks must not mutate other device properties")
+  }
+  stubHAL.layoutWrites += 1
+  if stubHAL.layoutWriteFailures > 0 {
+    stubHAL.layoutWriteFailures -= 1
+    return kAudioHardwareUnsupportedOperationError
+  }
+  let offset = MemoryLayout<AudioChannelLayout>.offset(of: \.mChannelDescriptions)!
+  let layout = data.assumingMemoryBound(to: AudioChannelLayout.self).pointee
+  precondition(layout.mChannelLayoutTag == kAudioChannelLayoutTag_UseChannelDescriptions)
+  let count = Int(layout.mNumberChannelDescriptions)
+  precondition(size == offset + count * MemoryLayout<AudioChannelDescription>.size)
+  let descriptions = data.advanced(by: offset)
+    .assumingMemoryBound(to: AudioChannelDescription.self)
+  stubHAL.layouts[id, default: [:]][address.pointee.mScope] =
+    (0..<count).map { descriptions[$0].mChannelLabel }
+  return noErr
+}
 
 // swift-format-ignore: AlwaysUseLowerCamelCase
 func AudioObjectGetPropertyDataSize(
@@ -268,6 +303,24 @@ func AudioObjectGetPropertyData(
   case kAudioDevicePropertyNominalSampleRate: data.storeBytes(of: device.rate, as: Double.self)
   case kAudioDevicePropertyDeviceIsAlive: data.storeBytes(of: device.alive, as: UInt32.self)
   case kAudioDevicePropertyBufferFrameSize: data.storeBytes(of: UInt32(128), as: UInt32.self)
+  case kAudioDevicePropertyPreferredChannelLayout:
+    guard let labels = stubHAL.layouts[id]?[address.pointee.mScope] else {
+      return kAudioHardwareBadPropertySizeError
+    }
+    let offset = MemoryLayout<AudioChannelLayout>.offset(of: \.mChannelDescriptions)!
+    let payload = offset + labels.count * MemoryLayout<AudioChannelDescription>.size
+    guard size.pointee >= UInt32(payload) else { return kAudioHardwareBadPropertySizeError }
+    let layout = data.assumingMemoryBound(to: AudioChannelLayout.self)
+    layout.pointee.mChannelLayoutTag = kAudioChannelLayoutTag_UseChannelDescriptions
+    layout.pointee.mChannelBitmap = []
+    layout.pointee.mNumberChannelDescriptions = UInt32(labels.count)
+    let descriptions = data.advanced(by: offset)
+      .assumingMemoryBound(to: AudioChannelDescription.self)
+    for (index, label) in labels.enumerated() {
+      descriptions[index] = AudioChannelDescription(
+        mChannelLabel: label, mChannelFlags: [], mCoordinates: (0, 0, 0))
+    }
+    size.pointee = UInt32(payload)
   case kAudioAggregateDevicePropertyActiveSubDeviceList:
     for (index, child) in device.children!.enumerated() {
       data.storeBytes(of: child, toByteOffset: index * 4, as: AudioDeviceID.self)

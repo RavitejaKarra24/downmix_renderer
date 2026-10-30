@@ -35,6 +35,11 @@ BlackHole is a free, open-source audio driver. macOS has no built-in way to hand
 7. Set the arrangement to **9.1.6** and make sure channels **1 through 16** are assigned.
    Click **Apply**, then **Done**.
 
+Downmix also installs this 9.1.6 bed layout on the selected input device each time you
+press **Start**, so players deliver every bed channel instead of a stereo fallback. The
+manual steps above are only needed to check or reorder the assignment yourself; the
+**Setup Checklist** shows whether the installed layout was accepted.
+
 ## Part 2 — Install Downmix
 
 **Before you start:** macOS will show a security warning the first time you open Downmix.
@@ -86,7 +91,8 @@ speakers.
 If your device list is long, use the filter box. You can pin the devices you use most from
 their right-click menu and drag them into the order you like.
 
-**Setup Checklist** explains the selected device, 48 kHz, permission, and manual speaker/routing
+**Setup Checklist** explains the selected device, 48 kHz, permission, the installed speaker
+layout, and manual routing
 requirements. **Advanced** shows buffer negotiation and current-run diagnostics. Queue latency
 is only the audio waiting inside Downmix, not your total listening latency.
 Small differences between the two 48 kHz device clocks are corrected automatically.
@@ -135,8 +141,12 @@ speakers, and that Downmix says **Stop** (meaning it is running) rather than **S
 **The sound is distorted or crackly.** Lower the **Preamp** value. If it still crackles,
 raise the buffer size in **Settings**.
 
-**Only some speakers seem to be coming through.** BlackHole is probably not configured as
-9.1.6. Redo Part 1, steps 4 through 7.
+**Only some speakers seem to be coming through.** If only L and R move in Downmix, your
+player sent a stereo stream — it uses the input device's speaker layout to choose its output
+channel count, and a layout it cannot convert makes it fall back to stereo. Press **Start** in
+Downmix (it installs the 9.1.6 bed layout) and reopen the file, or play the next file; a player
+that was already playing keeps its old stereo stream until it reopens the device. If it still
+happens, set **9.1.6** in **Audio MIDI Setup → Configure Speakers** and restart the player.
 
 **Left and right are swapped.** Turn on **Swap L/R** in **Settings**.
 
