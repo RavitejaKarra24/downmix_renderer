@@ -75,6 +75,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>LSUIElement</key><${LSUI_VALUE}/>
     <key>CFBundleIconFile</key><string>Icon</string>
     <key>NSMicrophoneUsageDescription</key><string>Downmix needs microphone access to open the selected multi-channel input device for real-time downmixing.</string>
+    <key>NSAppleEventsUsageDescription</key><string>Downmix reads the current Music track's sample rate so the selected input device can match it.</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>LSApplicationCategoryType</key><string>public.app-category.music</string>
     <key>BuildTimestamp</key><string>${BUILD_TIMESTAMP}</string>

@@ -314,8 +314,10 @@ struct DevicePickerCard: View {
     if title == "Input", device.inputChannelCount < 16 {
       warnings.append("Downmix rendering requires a 16-channel input")
     }
-    if device.nominalSampleRate > 0, abs(device.nominalSampleRate - 48_000) > 1 {
-      warnings.append("The audio engine requires a 48 kHz sample rate")
+    if device.nominalSampleRate > 0,
+      !InputRateConverter.supportedDeviceRates.contains(device.nominalSampleRate)
+    {
+      warnings.append("The audio engine supports 8–768 kHz sample rates")
     }
     return warnings.isEmpty ? nil : warnings.joined(separator: ". ")
   }

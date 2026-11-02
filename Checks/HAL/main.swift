@@ -391,29 +391,36 @@ func deviceRateAndWidthChecks() throws {
   stubHAL.devices[101]!.rate = 44_100
   let engine = try startEngine()
   require(engine.checkInputRate == 44_100, "Input follows the device rate")
-  require(engine.checkHasRateConverter, "Non-48 kHz input is converted internally")
+  require(
+    !engine.checkHasRateConverter, "Passthrough needs no converter when the output matches")
   require(engine.currentStatus.inputSampleRate == 44_100, "Status reports the live input rate")
   require(
-    engine.currentStatus.message.contains("44.1 kHz → 48 kHz"),
-    "Status names the converted rate: \(engine.currentStatus.message)")
+    engine.currentStatus.renderSampleRate == 44_100,
+    "The DSP and output render at the input rate")
+  require(
+    engine.currentStatus.message.contains("44.1 kHz"),
+    "Status names the render rate: \(engine.currentStatus.message)")
   require(
     engine.currentStatus.bedLayoutInstalled == true,
     "Bed layout still installs at the device's own rate")
   var inputUnit = stubHAL.units.values.first { $0.isInput }!
+  var outputUnit = stubHAL.units.values.first { !$0.isInput }!
   require(inputUnit.client.mSampleRate == 44_100, "Input unit opens at the device rate")
   require(inputUnit.client.mChannelsPerFrame == 16, "Input unit opens the full bed width")
+  require(outputUnit.client.mSampleRate == 44_100, "Output client follows the render rate")
+  require(stubHAL.devices[201]!.rate == 44_100, "The output device is set to match")
 
-  // Feed a known per-channel signal; the meters prove the converted path reaches the DSP.
+  // Feed a known per-channel signal; the meters prove the passthrough path reaches the DSP.
   stubHAL.inputValues = (0..<16).map { 0.1 / Float($0 + 1) }
   for _ in 0..<12 { require(stubHAL.inputCallback(frames: 512) == noErr, "44100 input renders") }
   engine.checkWatchdogTick()
   require(
     abs(engine.currentStatus.meters.inputPeaksDb[0] - 20 * log10(0.1)) < 1,
-    "Resampled input reaches the bed meters")
+    "Passthrough input reaches the bed meters")
 
-  // Live rate change, as a sample-rate switcher does at a track boundary.
-  // A rate change can fail a render before the next watchdog tick. The reopen must make
-  // that specific format error stale instead of stopping a healthy run.
+  // Live rate change, as Music matching or a switcher does at a track boundary. A stale
+  // client can fail one render before the watchdog reopens; that error must not stop it.
+  let originalUnits = Set(stubHAL.units.keys)
   stubHAL.devices[101]!.rate = 96_000
   require(
     stubHAL.inputCallback(frames: 512) == kAudioUnitErr_CannotDoInCurrentContext,
@@ -424,25 +431,34 @@ func deviceRateAndWidthChecks() throws {
     engine.currentStatus.diagnostics.renderErrorCount == 1,
     "The transient render error is counted but does not stop the run")
   require(engine.checkInputRate == 96_000, "Engine follows the new rate")
-  require(engine.checkHasRateConverter, "96 kHz still converts")
-  require(engine.currentStatus.inputSampleRate == 96_000, "Status follows the new rate")
+  require(!engine.checkHasRateConverter, "96 kHz is passthrough, not converted")
+  require(engine.currentStatus.renderSampleRate == 96_000, "Render rate follows the source")
   inputUnit = stubHAL.units.values.first { $0.isInput }!
+  outputUnit = stubHAL.units.values.first { !$0.isInput }!
   require(inputUnit.client.mSampleRate == 96_000, "Input unit reopens at 96 kHz")
-  require(stubHAL.disposalCount == 0, "Only the input unit is reopened, never disposed")
+  require(outputUnit.client.mSampleRate == 96_000, "Output client reopens at 96 kHz")
+  require(stubHAL.devices[201]!.rate == 96_000, "Output device follows the source rate")
+  require(stubHAL.disposalCount == 2, "Both old units disposed before replacing transport")
   require(
-    stubHAL.units.values.first { !$0.isInput }!.started,
-    "Output unit keeps running across the input reopen")
+    originalUnits.isDisjoint(with: stubHAL.units.keys),
+    "Fresh units discard stale device-side clocks/converters, not just client formats")
   for _ in 0..<24 { require(stubHAL.inputCallback(frames: 512) == noErr, "96000 input renders") }
   engine.checkWatchdogTick()
   require(
     abs(engine.currentStatus.meters.inputPeaksDb[0] - 20 * log10(0.1)) < 1,
     "Audio still reaches the meters after the rate change")
 
+  let unitsAt96k = Set(stubHAL.units.keys)
   stubHAL.devices[101]!.rate = 48_000
   engine.checkWatchdogTick()
   require(
+    unitsAt96k.isDisjoint(with: stubHAL.units.keys), "Returning to 48 kHz also replaces both units")
+  require(
     engine.currentStatus.phase == .running && !engine.checkHasRateConverter,
-    "Back at 48 kHz the converter is dropped")
+    "Back at 48 kHz the pipeline stays passthrough")
+  require(
+    stubHAL.devices[201]!.rate == 48_000 && abs(engine.checkInputRate - 48_000) < 0.5,
+    "Both devices follow the source rate")
 
   // A narrower input keeps rendering the slots it has instead of stopping.
   stubHAL.devices[101]!.inputChannels = 8
@@ -470,7 +486,7 @@ func deviceRateAndWidthChecks() throws {
   engine.checkWatchdogTick()
   require(engine.currentStatus.phase == .error, "One input channel stops with a clear message")
   require(engine.currentStatus.message.contains("at least two"), "Message names the minimum")
-  require(stubHAL.units.isEmpty && stubHAL.disposalCount == 2, "Both units disposed on failure")
+  require(stubHAL.units.isEmpty && stubHAL.disposalCount == 10, "All replaced units disposed")
 
   stubHAL.reset()
   stubHAL.devices[101]!.rate = 1_000
@@ -486,28 +502,174 @@ func deviceRateAndWidthChecks() throws {
     require(stubHAL.units.isEmpty, "Refused rates create no unit")
   }
 
-  // The output device may also run at another rate; AUHAL converts the stereo client.
+  // The DAC's rate list is the limit: without 96 kHz it falls back and says so.
   stubHAL.reset()
+  stubHAL.devices[101]!.rate = 96_000
+  stubHAL.devices[201]!.availableRates = [44_100, 48_000]
+  let limited = try startEngine()
+  require(
+    limited.currentStatus.phase == .running && limited.checkHasRateConverter,
+    "A limited output converts the source to its own rate")
+  require(
+    limited.checkInputRate == 96_000 && limited.currentStatus.renderSampleRate == 48_000,
+    "The source stays 96 kHz and the render falls back to 48 kHz")
+  require(
+    limited.currentStatus.message.contains("output limit"),
+    "The status names the output limit: \(limited.currentStatus.message)")
+  require(
+    stubHAL.units.values.first { !$0.isInput }!.client.mSampleRate == 48_000,
+    "The fallback output client is 48 kHz")
+  limited.stop()
+
+  // A limited output while starting at 44.1 kHz: input converted to the 48 kHz fallback.
+  stubHAL.reset()
+  stubHAL.devices[101]!.rate = 44_100
+  stubHAL.devices[201]!.availableRates = [48_000]
+  let converted = try startEngine()
+  require(
+    converted.currentStatus.renderSampleRate == 48_000 && converted.checkHasRateConverter,
+    "A 48 kHz-only output converts the 44.1 kHz source")
+  for _ in 0..<12 { require(stubHAL.inputCallback(frames: 512) == noErr, "fallback renders") }
+  converted.checkWatchdogTick()
+  require(converted.currentStatus.phase == .running, "Fallback keeps rendering")
+  converted.stop()
+
+  // An output rate changed elsewhere is restored to the passthrough rate.
+  stubHAL.reset()
+  let restored = try startEngine()
+  require(stubHAL.devices[201]!.rate == 48_000, "Output starts at the source rate")
+  let unitsBeforeOutputDrift = Set(stubHAL.units.keys)
   stubHAL.devices[201]!.rate = 44_100
-  let convertedOutput = try startEngine()
+  restored.checkWatchdogTick()
   require(
-    convertedOutput.currentStatus.phase == .running
-      && stubHAL.units.values.first { !$0.isInput }!.client.mSampleRate == 48_000,
-    "Output keeps a 48 kHz client while the device runs at another rate")
-  stubHAL.devices[201]!.rate = 96_000
-  convertedOutput.checkWatchdogTick()
+    unitsBeforeOutputDrift.isDisjoint(with: stubHAL.units.keys),
+    "Output-rate restoration rebuilds device-side timing even if the client rate stays 48 kHz")
   require(
-    convertedOutput.currentStatus.phase == .running,
-    "A live output rate change is not a failure")
-  convertedOutput.stop()
-  require(convertedOutput.currentStatus.inputSampleRate == nil, "Stopped status clears the rate")
+    restored.currentStatus.phase == .running && stubHAL.devices[201]!.rate == 48_000,
+    "A drifted output rate is restored instead of stopping")
+  restored.stop()
+  require(restored.currentStatus.inputSampleRate == nil, "Stopped status clears the rate")
 
   stubHAL.reset()
   stubHAL.devices[201]!.rate = 44_100
   let keepAlive = try startEngine(keepAlive: true)
   require(keepAlive.currentStatus.phase == .keepAlive, "Keep-alive accepts any output rate")
+  require(
+    stubHAL.units.values.first { !$0.isInput }!.client.mSampleRate == 44_100,
+    "Keep-alive keeps the output device rate")
   keepAlive.stop()
-  print("PASS: actual-engine live input rate/width reopen, clamping and output rate changes")
+  print(
+    "PASS: actual-engine passthrough rate/width reopen, output matching, limits and keep-alive")
+}
+
+/// A fresh client ASBD is not sufficient when an AUHAL/driver retains device-side
+/// conversion state. Pump valid output buffers as well as input, including repeated
+/// returns to 48 kHz, and assert sustained delivery rather than just matching metadata.
+func rateTransitionDeliveryChecks() throws {
+  stubHAL.reset()
+  stubHAL.devices[101]!.rate = 44_100
+  let engine = try startEngine()
+  stubHAL.inputValues = [0.05, 0.05] + [Float](repeating: 0, count: 14)
+  for rate in [44_100.0, 48_000, 44_100, 48_000, 96_000, 48_000] {
+    engine.checkRequestInputRate(rate)
+    engine.checkWatchdogTick()
+    for _ in 0..<3_000 {
+      require(stubHAL.inputCallback(frames: 128) == noErr, "Clocked input renders")
+      _ = stubHAL.clockedOutputCallback(deviceFrames: 128)
+    }
+    let samples = stubHAL.clockedOutputCallback(deviceFrames: 128)
+    engine.checkWatchdogTick()
+    require(engine.currentStatus.phase == .running, "Clocked pipeline stays running")
+    require(
+      engine.currentStatus.diagnostics.underrunCount == 0, "No sustained starvation at \(rate)")
+    require(engine.currentStatus.diagnostics.overrunCount == 0, "No producer overflow at \(rate)")
+    require(
+      samples.allSatisfy { $0.isFinite && $0 > 0.01 && $0 < 0.1 },
+      "Stereo signal reaches every output sample at \(rate), without silence or clipping")
+  }
+  engine.stop()
+
+  for failure in ["disposal", "retained-disposal", "initialize", "cancel"] {
+    stubHAL.reset()
+    let gate = AudioRenderGate()
+    let engine = try startEngine(gate: gate)
+    let nextUnit = stubHAL.nextUnit
+    if failure == "disposal" { stubHAL.disposalFailures = 1 }
+    if failure == "retained-disposal" { stubHAL.disposalFailures = 3 }
+    if failure == "initialize" { stubHAL.initializeFailure = kAudioUnitErr_FailedInitialization }
+    if failure == "cancel" { stubHAL.disposalProbe = { gate.close() } }
+    engine.checkRequestInputRate(44_100)
+    engine.checkWatchdogTick()
+    if failure == "cancel" {
+      require(stubHAL.units.values.allSatisfy { !$0.started }, "Cancelled replacement never starts")
+      require(!gate.isOpen, "Replacement never reopens the one-way cancellation gate")
+      engine.stop()
+    } else {
+      require(engine.currentStatus.phase == .error, "Failed replacement stops safely: \(failure)")
+      if failure == "retained-disposal" {
+        require(stubHAL.units.count == 2, "Failed disposal retains both old units")
+        require(engine.checkStorageAllocated, "Callback storage retained until disposal succeeds")
+        require(stubHAL.nextUnit == nextUnit, "No fresh units while old callbacks remain reachable")
+        require(!gate.isOpen, "Failed replacement mutes late callbacks")
+        engine.stop()  // Retry disposal, now successful.
+      }
+      require(stubHAL.units.isEmpty, "Failed replacement cleans up: \(failure)")
+      require(!engine.checkStorageAllocated, "Storage released after disposal: \(failure)")
+      if failure == "disposal" {
+        require(stubHAL.nextUnit == nextUnit, "No new unit or storage before old disposal succeeds")
+      }
+    }
+  }
+  print("PASS: clocked rate-transition signal delivery and replacement failure/cancellation")
+}
+
+/// Matching the input device to a Music track rate is best-effort: the device is only
+/// changed while rendering, only to an advertised rate, and never for keep-alive.
+func inputRateRequestChecks() throws {
+  stubHAL.reset()
+  let engine = try startEngine()
+  require(stubHAL.devices[101]!.rate == 48_000, "Starts at the device rate")
+  engine.checkRequestInputRate(96_000)
+  require(stubHAL.devices[101]!.rate == 96_000, "The requested rate reaches the device")
+  engine.checkWatchdogTick()
+  require(engine.currentStatus.phase == .running, "A rate request keeps rendering")
+  require(engine.checkInputRate == 96_000, "The input reopens at the requested rate")
+  require(
+    stubHAL.units.values.first { $0.isInput }!.client.mSampleRate == 96_000,
+    "The input client format follows the requested rate")
+  require(
+    stubHAL.devices[201]!.rate == 96_000
+      && stubHAL.units.values.first { !$0.isInput }!.client.mSampleRate == 96_000,
+    "The output device and client follow the matched rate")
+  require(
+    abs((engine.currentStatus.inputSampleRate ?? 0) - 96_000) < 0.5,
+    "Status reports the matched rate")
+  require(!engine.checkHasRateConverter, "Matching at 96 kHz is passthrough")
+
+  engine.checkRequestInputRate(128_000)
+  require(stubHAL.devices[101]!.rate == 96_000, "An unavailable rate is never applied")
+  engine.checkWatchdogTick()
+  require(engine.currentStatus.phase == .running, "A refused rate does not stop the run")
+
+  engine.checkRequestInputRate(44_100)
+  engine.checkWatchdogTick()
+  require(
+    engine.checkInputRate == 44_100 && !engine.checkHasRateConverter,
+    "A lower advertised rate is matched and passthrough")
+  require(stubHAL.devices[201]!.rate == 44_100, "The output follows the lower rate")
+  engine.stop()
+
+  stubHAL.reset()
+  let keepAlive = try startEngine(keepAlive: true)
+  keepAlive.checkRequestInputRate(96_000)
+  require(stubHAL.devices[201]!.rate == 48_000, "Keep-alive never changes a device rate")
+  keepAlive.stop()
+
+  stubHAL.reset()
+  let stopped = AudioEngine(queue: checkQueue)
+  stopped.checkRequestInputRate(96_000)
+  require(stubHAL.devices[101]!.rate == 48_000, "A stopped engine never changes system audio")
+  print("PASS: actual-engine input rate requests for Music matching")
 }
 
 checkQueue.async {
@@ -518,6 +680,8 @@ checkQueue.async {
     try nilOutputChecks()
     try bedLayoutChecks()
     try deviceRateAndWidthChecks()
+    try rateTransitionDeliveryChecks()
+    try inputRateRequestChecks()
     try cleanupChecks()
     print("All isolated HAL checks passed (no hardware or system routes touched)")
     exit(0)

@@ -256,6 +256,33 @@ enum DeviceManager {
     let rate: Double
   }
 
+  /// Nominal rates the device advertises. `nil` when the property is unreadable.
+  static func availableNominalRates(id: AudioDeviceID) -> [AudioValueRange]? {
+    var property = AudioObjectPropertyAddress(
+      mSelector: kAudioDevicePropertyAvailableNominalSampleRates,
+      mScope: kAudioObjectPropertyScopeGlobal,
+      mElement: kAudioObjectPropertyElementMain
+    )
+    var size: UInt32 = 0
+    guard AudioObjectGetPropertyDataSize(id, &property, 0, nil, &size) == noErr, size > 0,
+      Int(size).isMultiple(of: MemoryLayout<AudioValueRange>.size)
+    else { return nil }
+    let count = Int(size) / MemoryLayout<AudioValueRange>.size
+    var ranges = [AudioValueRange](repeating: AudioValueRange(), count: count)
+    guard AudioObjectGetPropertyData(id, &property, 0, nil, &size, &ranges) == noErr,
+      Int(size) == count * MemoryLayout<AudioValueRange>.size
+    else { return nil }
+    return ranges
+  }
+
+  /// Near-exact match: a device that offers 96 kHz reports it as a point or a small range.
+  static func isSampleRateAvailable(_ rate: Double, id: AudioDeviceID) -> Bool {
+    guard let ranges = availableNominalRates(id: id) else { return true }
+    return ranges.contains { range in
+      rate >= range.mMinimum - 0.5 && rate <= range.mMaximum + 0.5
+    }
+  }
+
   /// Live input width and nominal rate. Unlike the cached catalog these are read at the
   /// moment of use, because players and sample-rate switchers change them while running.
   static func inputFormat(id: AudioDeviceID) -> InputFormat? {

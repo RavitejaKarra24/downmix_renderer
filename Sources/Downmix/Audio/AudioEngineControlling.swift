@@ -13,6 +13,9 @@ protocol AudioEngineControlling: AnyObject {
     keepAliveOnly: Bool
   ) throws
   func updateConfiguration(_ configuration: DownmixProcessor.Configuration)
+  /// Best-effort: asks the running input device to change its nominal rate. The
+  /// worker reopens the input when the HAL applies it. Never changes the output.
+  func setInputSampleRate(_ rate: Double)
   func stop()
 }
 
@@ -33,6 +36,9 @@ protocol AudioEngineWorker: AnyObject, Sendable {
     renderGate: AudioRenderGate?
   ) throws
   func updateConfiguration(_ configuration: DownmixProcessor.Configuration)
+  /// Best-effort: asks the running input device to change its nominal rate. The
+  /// worker reopens the input when the HAL applies it. Never changes the output.
+  func requestInputSampleRate(_ rate: Double)
   func stop()
 }
 

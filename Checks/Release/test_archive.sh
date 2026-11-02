@@ -17,6 +17,7 @@ for entry in \
   "CFBundleShortVersionString=$MARKETING_VERSION" "CFBundleVersion=$BUILD_NUMBER" \
   "LSMinimumSystemVersion=$MACOS_MIN_VERSION" 'CFBundlePackageType=APPL' \
   'NSMicrophoneUsageDescription=Inert verification fixture' \
+  'NSAppleEventsUsageDescription=Inert verification fixture' \
   "SourceDigest=$("$ROOT/Scripts/source_digest.sh")"; do
   /usr/libexec/PlistBuddy -c "Add :${entry%%=*} string ${entry#*=}" "$PLIST"
 done

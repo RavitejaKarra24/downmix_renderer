@@ -20,6 +20,7 @@ final class FakeEngine: AudioEngineControlling {
   }
 
   var events: [Event] = []
+  var requestedRates: [Double] = []
   var startFailure: Error?
   var fatalStartStatus: EngineStatus?
   private var statusHandler: ((EngineStatus) -> Void)?
@@ -60,6 +61,10 @@ final class FakeEngine: AudioEngineControlling {
     events.append(.configuration(configuration))
   }
 
+  func setInputSampleRate(_ rate: Double) {
+    requestedRates.append(rate)
+  }
+
   func stop() {
     events.append(.stop)
     emit(EngineStatus(phase: .stopping))
@@ -98,7 +103,10 @@ final class Fixture {
   var writes: [AppPreferences] = []
   var writeFailure: Error?
 
-  func makeState(_ preferences: AppPreferences = AppPreferences()) -> AppState {
+  func makeState(
+    _ preferences: AppPreferences = AppPreferences(),
+    musicRateMonitor: (any MusicRateMonitoring)? = nil
+  ) -> AppState {
     AppState(
       engine: engine,
       preferences: preferences,
@@ -119,8 +127,33 @@ final class Fixture {
         if let writeFailure { throw writeFailure }
         writes.append(preferences)
       },
-      installListeners: false
+      installListeners: false,
+      musicRateMonitor: musicRateMonitor
     )
+  }
+}
+
+/// Records AppState's monitor lifecycle and replays Music rate observations on demand.
+final class FakeMusicRateMonitor: MusicRateMonitoring {
+  private(set) var starts = 0
+  private(set) var stops = 0
+  private var report: (@Sendable (MusicRateObservation) -> Void)?
+
+  func start(report: @escaping @Sendable (MusicRateObservation) -> Void) {
+    precondition(Thread.isMainThread)
+    starts += 1
+    self.report = report
+  }
+
+  func stop() {
+    precondition(Thread.isMainThread)
+    stops += 1
+    report = nil
+  }
+
+  func emit(_ observation: MusicRateObservation) {
+    precondition(Thread.isMainThread)
+    report?(observation)
   }
 }
 
@@ -170,7 +203,89 @@ struct LifecycleChecks {
     try await persistenceChecks()
     try await permissionChecks()
     try loggingChecks()
-    print("All AppState lifecycle checks passed (14 groups)")
+    try musicRateChecks()
+    print("All AppState lifecycle checks passed (15 groups)")
+  }
+
+  /// Matching the input device to Music's track rate is opt-in, best-effort and only
+  /// active while the renderer runs. Music metadata is parsed deterministically.
+  @MainActor
+  static func musicRateChecks() throws {
+    try require(
+      MusicTrackRateMonitor.parse("96000|Sofia") == .playing(rate: 96_000, track: "Sofia"),
+      "A track line carries the rate and name")
+    try require(
+      MusicTrackRateMonitor.parse("48000") == .playing(rate: 48_000, track: ""),
+      "A rate without a name is still a rate")
+    for idle in ["paused", "no track", "", "0|Broken", "-96000|Broken"] {
+      try require(MusicTrackRateMonitor.parse(idle) == .idle, "Idle output: \(idle)")
+    }
+    try require(MusicTrackRateMonitor.parse(nil) == .idle, "No script output is idle")
+
+    let fixture = Fixture()
+    let monitor = FakeMusicRateMonitor()
+    let state = fixture.makeState(musicRateMonitor: monitor)
+    state.start()
+    try require(monitor.starts == 1, "Rendering starts Music rate monitoring")
+    try require(
+      state.setupChecklist.checks.first { $0.id == .musicRate }?.status == .manual,
+      "The checklist waits for a track rather than claiming a match")
+
+    monitor.emit(.playing(rate: 96_000, track: "Sofia"))
+    try require(
+      fixture.engine.requestedRates == [96_000],
+      "A 96 kHz track requests a 96 kHz input device")
+    try require(state.detectedMusicRate == 96_000, "The detected rate is observable")
+    try require(
+      state.setupChecklist.checks.first { $0.id == .musicRate }?.status == .manual,
+      "A pending switch stays manual, never verified")
+
+    monitor.emit(.playing(rate: 96_000, track: "Sofia again"))
+    try require(
+      fixture.engine.requestedRates.count == 1,
+      "Repeated readings do not repeat the rate request")
+
+    fixture.catalog[0] = AudioDeviceInfo(
+      id: Fixture.input.id, name: Fixture.input.name, uid: Fixture.input.uid,
+      inputChannelCount: 16, outputChannelCount: 0, nominalSampleRate: 96_000)
+    state.refreshDevices()
+    try require(
+      state.setupChecklist.checks.first { $0.id == .musicRate }?.status == .verified,
+      "A matched input rate is verified")
+
+    monitor.emit(.playing(rate: 44_100, track: "Older"))
+    try require(
+      fixture.engine.requestedRates == [96_000, 44_100],
+      "A different track rate requests a different device rate")
+
+    monitor.emit(.idle)
+    try require(state.detectedMusicRate == nil, "Pausing Music clears the detected rate")
+    try require(
+      fixture.engine.requestedRates == [96_000, 44_100],
+      "Pausing Music does not change the device rate")
+
+    monitor.emit(.failure(.automationDenied))
+    try require(
+      state.setupChecklist.checks.first { $0.id == .musicRate }?.status == .needsAttention,
+      "Denied Automation access needs attention instead of a silent failure")
+    try require(
+      state.setupChecklist.checks.first { $0.id == .musicRate }?
+        .guidance.contains("Automation") == true,
+      "Guidance names the Automation permission")
+
+    state.stop()
+    try require(monitor.stops == 1, "Stopping the renderer stops rate monitoring")
+
+    state.start()
+    try require(monitor.starts == 2, "Restarting resumes rate monitoring")
+    state.preferences.matchMusicSampleRate = false
+    state.persist()
+    try require(monitor.stops == 2, "Turning matching off stops monitoring")
+    try require(
+      state.detectedMusicRate == nil && state.musicRateFailure == nil,
+      "Turning matching off clears Music state")
+    state.stop()
+    print("PASS music rate: parse, monitor lifecycle, request deduplication and checklist states")
   }
 
   /// The diagnostics log must stay silent in tests, record failures, detect an abrupt
@@ -611,8 +726,9 @@ struct LifecycleChecks {
       ready.checks.filter { $0.status == .verified }.count == 5,
       "Selected 16-channel/48k/safe stereo/authorized route must pass automatic checks")
     try require(
-      ready.checks.filter { $0.status == .manual }.map(\.id) == [.speakerMapping, .systemOutput],
-      "Speaker mapping and system output must always remain manual, never certified")
+      ready.checks.filter { $0.status == .manual }.map(\.id)
+        == [.musicRate, .speakerMapping, .systemOutput],
+      "Music matching, speaker mapping and system output must remain manual, never certified")
     try require(
       fixture.enumerations == 1 && fixture.engine.events.isEmpty && fixture.permissionRequests == 0,
       "Checklist must not enumerate hardware, start audio, or eagerly request permission")
@@ -685,9 +801,10 @@ struct LifecycleChecks {
       narrow.checks.filter { $0.status == .needsAttention }.map(\.id) == [.input, .output],
       "Narrow input and mono output must need attention, but other rates must not")
     try require(
-      narrow.checks.first { $0.id == .inputRate }?.guidance.contains("converted to 48 kHz") == true
+      narrow.checks.first { $0.id == .inputRate }?
+        .guidance.contains("renders at this rate") == true
         && narrow.checks.first { $0.id == .outputRate }?.status == .verified,
-      "Non-48 kHz devices are described as converted, not as failures")
+      "Non-48 kHz devices are described as passthrough, not as failures")
     try require(
       narrow.checks.first { $0.id == .input }?
         .guidance.contains("only that many bed slots") == true,

@@ -334,7 +334,8 @@ func longClock(_ initialPPM: Double, changing: Bool = false, fixedBlock: Int? = 
 // reversal starvation. These are actual FIR renders, not the controller surrogate.
 func renderedMinimumReservoirClocks() {
   for initialPPM in [-2000.0, 2000.0, 1000.0] {
-    let target = AdaptiveStereoResampler.minimumRecommendedTargetFrames
+    let target = AdaptiveStereoResampler.minimumRecommendedTargetFrames(
+      forSampleRate: 48_000)
     let f = Fixture(target: target, maximum: 128)
     func signal(_ frame: Int) -> (Float, Float) { (0.125, -0.125) }
     f.feed(target + 128, signal: signal)

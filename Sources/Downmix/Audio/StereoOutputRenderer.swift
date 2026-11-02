@@ -9,7 +9,10 @@ struct StereoOutputBuffering {
   let targetFrames: Int
   let ringCapacityFrames: Int
 
-  init(inputFrames: Int, outputFrames: Int, maximumInputFrames: Int, maximumOutputFrames: Int) {
+  init(
+    inputFrames: Int, outputFrames: Int, maximumInputFrames: Int, maximumOutputFrames: Int,
+    sampleRate: Double
+  ) {
     precondition(inputFrames >= 0 && outputFrames > 0)
     precondition(maximumInputFrames >= inputFrames && maximumOutputFrames >= outputFrames)
     precondition(maximumInputFrames <= Self.maximumSliceFrames)
@@ -17,7 +20,8 @@ struct StereoOutputBuffering {
     // The 100 ppm/s clock slew needs startup/reversal headroom; a 512-frame
     // reservoir can repeatedly starve before learning a supported negative skew.
     targetFrames = max(
-      AdaptiveStereoResampler.minimumRecommendedTargetFrames, 4 * max(inputFrames, outputFrames))
+      AdaptiveStereoResampler.minimumRecommendedTargetFrames(forSampleRate: sampleRate),
+      4 * max(inputFrames, outputFrames))
     let maximumConsumption = Int(ceil(Double(maximumOutputFrames) * 1.002))
     ringCapacityFrames = max(4800, targetFrames + maximumInputFrames + maximumConsumption + 64)
   }
@@ -33,14 +37,15 @@ final class StereoOutputRenderer {
 
   init(
     ring: FloatRingBuffer?, diagnostics: AudioDiagnostics, maximumFrames: UInt32,
-    driftCorrection: Bool = false, targetFrames: Int = 2048
+    driftCorrection: Bool = false, targetFrames: Int = 2048, sampleRate: Double = 48_000
   ) {
     self.ring = ring
     self.diagnostics = diagnostics
     self.maximumFrames = maximumFrames
     if driftCorrection, let ring {
       resampler = AdaptiveStereoResampler(
-        ring: ring, targetFrames: targetFrames, maximumOutputFrames: Int(maximumFrames)
+        ring: ring, targetFrames: targetFrames, maximumOutputFrames: Int(maximumFrames),
+        sampleRate: sampleRate
       )
     } else {
       resampler = nil

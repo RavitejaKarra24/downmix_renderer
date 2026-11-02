@@ -14,6 +14,9 @@ struct AppPreferences: Codable, Equatable, Sendable {
   var lfeLowpass: Bool = true
   var swapOutputs: Bool = false
   var autoStart: Bool = false
+  /// Match the input device's nominal rate to the current Music.app track. Off means the
+  /// device keeps whatever rate the user set in Audio MIDI Setup.
+  var matchMusicSampleRate: Bool = true
 
   static let storageURL: URL = {
     let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
@@ -52,7 +55,7 @@ extension AppPreferences {
   private enum CodingKeys: String, CodingKey {
     case inputDeviceUID, outputDeviceUID, inputDeviceName, outputDeviceName
     case layoutPresetName, framesPerBuffer, preampDb, inputLatencyMs, outputLatencyMs
-    case keepOutputAlive, lfeLowpass, swapOutputs, autoStart
+    case keepOutputAlive, lfeLowpass, swapOutputs, autoStart, matchMusicSampleRate
   }
 
   init(from decoder: Decoder) throws {
@@ -82,6 +85,9 @@ extension AppPreferences {
     lfeLowpass = try container.decodeIfPresent(Bool.self, forKey: .lfeLowpass) ?? lfeLowpass
     swapOutputs = try container.decodeIfPresent(Bool.self, forKey: .swapOutputs) ?? swapOutputs
     autoStart = try container.decodeIfPresent(Bool.self, forKey: .autoStart) ?? autoStart
+    matchMusicSampleRate =
+      try container.decodeIfPresent(Bool.self, forKey: .matchMusicSampleRate)
+      ?? matchMusicSampleRate
     self = normalized()
   }
 
@@ -101,5 +107,6 @@ extension AppPreferences {
     try container.encode(preferences.lfeLowpass, forKey: .lfeLowpass)
     try container.encode(preferences.swapOutputs, forKey: .swapOutputs)
     try container.encode(preferences.autoStart, forKey: .autoStart)
+    try container.encode(preferences.matchMusicSampleRate, forKey: .matchMusicSampleRate)
   }
 }

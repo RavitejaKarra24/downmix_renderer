@@ -210,10 +210,10 @@ optimized builds. Release fixtures reject failed UI/package gates, committed whi
 wrong builds, stale source digests, thin binaries and invalid signatures while preserving
 the prior archive. These are deterministic contracts, not real driver certification.
 
-The lifecycle suite has **14 groups** (including diagnostics-log behavior), asynchronous
+The lifecycle suite has **15 groups** (including diagnostics-log and Music-rate behavior), asynchronous
 control **11**, and UI **11** (**1 deterministic ordering + 10 rendered native**), including
 favorites/search, Settings transport/buffer/keep-alive, setup-sheet fake
-permission/cancellation and save recovery. The DSP/ring suite has **61,728 assertions**
+permission/cancellation and save recovery. The DSP/ring suite has **72,048 assertions**
 (content layouts, input rate conversion, matrix/ring/clock) and the clock/transport/mailbox
 suites remain intact.
 
@@ -293,6 +293,152 @@ Remaining: a channel or rate switch is not sample-continuous (about 0.25 s gap),
 converter is not bit-exact to the device, and multi-hour playback/instrumentation on the
 user's devices is still pending. The hardware harness was an ad-hoc local tool and is not
 committed; the reproducible parts are the stub-HAL and DSP/offline checks above.
+
+### Music rate matching — 1.5.0 (build 7)
+
+The previous release made Downmix *follow* the input device's rate. This adds the other
+half, explicitly requested: match that rate to what Music is playing. It is a visible
+opt-out control, not a silent system change.
+
+- `MusicTrackRateMonitor` reads `sample rate of current track` from Music with AppleScript on
+  one utility queue. It never launches Music, polls every 2 s while a track plays and every
+  20 s otherwise, and also reacts to Music's `playerInfo` distributed notification. A denied
+  Automation permission (`-1743`), a stopped Music, or a track without a rate is reported as
+  observation state, never as an audio failure.
+- `AudioEngine.requestInputSampleRate` runs on the worker queue with the rest of HAL control.
+  It acts only while the renderer (not keep-alive) is running, only for an advertised device
+  rate (`kAudioDevicePropertyAvailableNominalSampleRates`), and never touches the output
+  device. The existing watchdog then reopens only the input unit, so the stereo output keeps
+  running through the switch.
+- `AppState` starts/stops monitoring with the renderer and the preference, requests a rate
+  only when the reported value differs from the input device's current rate, and never
+  repeats an outstanding request. A new checklist row (**Music rate matching**) reports the
+  detected rate, the current input rate, waiting/verified states, and the Automation remedy.
+  Settings → Audio has the opt-out toggle plus the live `Music X Hz · input Y Hz` line.
+- `NSAppleEventsUsageDescription` is added to the bundle and the archive gate requires it.
+- The internal DSP remains 48 kHz: matching avoids macOS's implicit downsample and makes the
+  true input rate visible, but the stereo render is still 48 kHz.
+
+Verification:
+
+- `Checks/HAL` drives the actual engine with the stub HAL: a request changes the device rate
+  and the next watchdog reopens the input at it; unavailable rates are refused without
+  stopping; keep-alive and stopped engines never change a device rate; the initial rate
+  request keeps rendering.
+- `Checks/Lifecycle` (now **15 groups**) covers script-output parsing, monitor start/stop
+  with the renderer and the toggle, request deduplication, paused-Music behaviour, the
+  Automation-denied row, and verified/pending checklist states.
+- Real-hardware chain test on this Mac (actual `AudioEngine`, BlackHole input, silent Dolby
+  Audio Bridge output): with BlackHole forced to 44.1 kHz and Music playing a 48 kHz library
+  track, the monitor reported `48000`, the engine requested it, BlackHole moved to 48 kHz,
+  and the engine stayed running with `inputSampleRate = 48000`. The only 96 kHz material on
+  this Mac lives outside the Music library, and no library track above 48 kHz exists, so the
+  96 kHz report path is covered by the deterministic suites above rather than by a real
+  96 kHz library track.
+
+Remaining: allow/deny the Automation prompt in the real app; import a 96 kHz folder into
+Music and listen through a full switch; other players (IINA/mpv/VLC) expose no rate, so they
+still need Audio MIDI Setup or a switcher; the mix stays 48 kHz until/unless a variable-rate
+DSP is built.
+
+### Native-rate passthrough — 1.6.0 (build 8)
+
+Explicit request: a 96 kHz file must reach the DAC at 96 kHz, 44.1 kHz at 44.1 kHz — no
+down- or upsampling anywhere in Downmix. The downmix matrix is rate-independent; only the
+rate-dependent engine parts had to change. The fixed 48 kHz DSP was a design choice, not a
+downmixing limit.
+
+Implementation:
+
+- `DownmixProcessor.Configuration` carries the pipeline rate. `RealtimeConfiguration` now
+  also carries the rate-derived LFE biquad coefficients (computed on the control side) and
+  the matched dry delay, so the callback never computes coefficients. The dry delay is
+  3.5833 ms (172 samples at 48 kHz) scaled to the rate; delay storage is allocated for the
+  maximum supported rate, so a rate change never allocates.
+- The clock-drift controller, reservoir floor (42.7 ms at the pipeline rate), stereo queue
+  geometry and `queueLatencyMs` are rate-aware. The 48-tap drift kernel is unchanged: it is
+  a ±2000 ppm corrector, not a general converter.
+- The engine resolves `pipelineRate = input device rate` when the output device advertises
+  that rate, sets the output device's nominal rate, and configures the output client at the
+  same rate. Otherwise it falls back to 48 kHz (then 44.1 kHz) and the status says
+  **output limit**.
+- Any input rate/width change or output-rate drift reopens the whole pipeline (both units)
+  at the new format; the output unit now starts before the input so the producer cannot
+  overfill the ring while the output initializes. Diagnostics carry the pipeline rate.
+- The passthrough rate is therefore defined by the input device, not by file metadata: for
+  Music the 1.5.0 matching sets the input device per track; other players that set the
+  device similarly get native-rate passthrough. Status/checklist report input, render and
+  output rates and name the fallback.
+
+Verification:
+
+- DSP (72,048 assertions): matrix sums at 44.1/48/88.2/96/176.4/192/384 kHz; the dry delay
+  equals `round(3.5833 ms × rate)` and appears exactly there; the LFE filter keeps its
+  125 Hz corner (30 Hz pass, 1 kHz stop); a rate change clears filter/delay history;
+  `RealtimeConfiguration` carries the same coefficients.
+- HAL: 44.1 kHz start renders/opens the output at 44.1 kHz; a 96 kHz request/config moves
+  input, DSP, output client and output device to 96 kHz with no converter; a 48/44.1-only
+  output falls back with **output limit**; an externally drifted output rate is restored;
+  keep-alive keeps the output device rate and never changes it.
+- Lifecycle (15 groups), asynchronous control (11), metering, transport, clock drift (48 kHz
+  baseline) and rendered UI all pass; the text now describes passthrough.
+- Real hardware: 96 kHz input → DSP and output device 96 kHz (silent Dolby bridge); the
+  FIIO followed 44.1 → 96 kHz live; 12 s at 96 kHz showed 0 overruns/underruns and a stable
+  4096-frame queue after the start order fix. The previous 30 kHz loopback experiment
+  did not establish ultrasonic preservation: meters cannot identify a tone's frequency,
+  and the probe's signal/capture behavior was not qualified. No final analog DAC signal
+  was captured, nor was a Dolby-bridge low-pass limitation independently established.
+
+Remaining: physical-output listening, long-duration qualification and real 192/384 kHz
+profiling. The later 48 kHz user report and logs below supersede the earlier inference
+that rate-switch timing problems were always brief BlackHole transients.
+
+### Rate-switch starvation fix — 1.6.1 (build 9)
+
+The user reported distorted/janky 48 kHz playback. Installed 1.6.0 logs confirmed ongoing
+starvation after 44.1 → 48 kHz: about 31.7 underrun events/second for several minutes,
+correction saturated at −2000 ppm, no render errors or overruns, despite all displayed
+rates matching. This was not ordinary independent-clock drift.
+
+- Replace both AUHAL instances on input rate/width changes and external output-rate
+  changes, rather than uninitializing/reusing them with a new client ASBD. Reusing the
+  units appears to retain stale device-side timing/conversion state. Both old instances
+  must dispose successfully before callback-visible storage is replaced; setup/disposal
+  failures stop safely, and the existing one-way Stop gate is never reopened.
+- Reuse normal device binding, buffer negotiation and client setup for the new units;
+  start output before input. Preserve the run's failure counters. Clear only the stale
+  old-generation format failure while quiescent, not after fresh callbacks begin.
+- Extend isolated HAL checks with an adversarial stale device-rate cache surviving
+  uninitialize. Pump valid stereo output, not just input meters, through repeated
+  44.1/48/96/48 switches; check every final output sample and underrun/overrun counters.
+  Add replacement disposal/setup failure and cancellation checks.
+- Real-hardware A/B: the old binary reproduced sustained starvation during a Music/FIIO
+  rate transition (3,094 new underrun events in an eight-second settled window). The
+  fresh-unit binary passed the same six-step sequence, including three 48 kHz windows,
+  with zero settled underruns/overruns and a 2,048-frame queue at 48 kHz.
+
+- Longer transport check: two one-minute settled windows at 48 kHz with real Music
+  audio reaching the engine and FIIO, with an intervening 44.1 kHz switch, had zero new
+  underruns/overruns, a stable 2,048-frame queue and correction 0 ppm. The harness's
+  named-track selection failed because those streaming tracks were not in the local
+  library; it instead exercised the existing playing Music source. This verifies
+  transport after manual rate changes, not automatic named-track selection. The first
+  44.1 kHz window was initially silent and is not an audio-clarity acceptance test.
+  Brief transition underruns still occur before the watchdog replaces the units.
+
+Full release checks passed (72,048 DSP/ring assertions, lifecycle, async control,
+clock/transport, metering, rendered UI and archive fixtures). Isolated HAL checks also
+passed under Thread Sanitizer. The universal 1.6.1 (9) archive passed signature, version,
+architecture and current-source verification.
+
+Installed-runtime verified: 1.6.1 (9) launched from `~/Applications/Downmix.app` and
+passed code-signature verification. After the user granted microphone access and played
+Deva Deva, the real Music monitor observed 44.1 then 48 kHz and automatically moved
+BlackHole, DSP and FIIO to 48 kHz. Installed-app heartbeats for a minute showed no new
+underruns after the switch (75 transient events remained constant), no overruns/render
+errors, a 2,048-frame queue and 0 ppm correction. The user confirmed physical playback
+was clear: “now it is good”. No analog signal capture or multi-hour qualification is
+claimed.
 
 ### Remaining release qualification
 

@@ -1,15 +1,21 @@
 import Foundation
 
 /// Time-scaled queue PI, shared with the offline clock checks (not a second model).
-/// Positive correction consumes source faster. Units: frames, seconds, ppm at 48 kHz.
-/// A one-second fill filter rejects packet jitter; conditional integration prevents
-/// windup at BOTH the rate and slew limits. Only the output consumer may mutate it.
+/// Positive correction consumes source faster. Units: frames, seconds, ppm at the
+/// pipeline sample rate. A one-second fill filter rejects packet jitter; conditional
+/// integration prevents windup at BOTH the rate and slew limits. Only the output
+/// consumer may mutate it.
 struct AdaptiveClockDriftController {
   static let maximumPPM = 2000.0
   static let slewPPMPerSecond = 100.0
+  let sampleRate: Double
   private(set) var correctionPPM = 0.0
   private var filteredError = 0.0
   private var integral = 0.0
+
+  init(sampleRate: Double = 48_000) {
+    self.sampleRate = sampleRate > 0 && sampleRate.isFinite ? sampleRate : 48_000
+  }
 
   mutating func reset() {
     correctionPPM = 0
@@ -26,7 +32,7 @@ struct AdaptiveClockDriftController {
 
   mutating func step(errorFrames: Double, frameCount: Int) {
     guard frameCount > 0 else { return }
-    let seconds = Double(frameCount) / 48_000
+    let seconds = Double(frameCount) / sampleRate
     filteredError += seconds / (1 + seconds) * (errorFrames - filteredError)
     let proposedIntegral = integral + 0.2 * filteredError * seconds
     let proposedCommand = 4 * filteredError + proposedIntegral
@@ -54,10 +60,12 @@ struct AdaptiveClockDriftController {
 /// lookahead, excluding consumed history), floored at 25 frames. Ring capacity must
 /// accommodate target + maximumOutputFrames + producer packet/jitter headroom.
 /// Startup waits for target + requested output frames. The 48-tap, 1024-phase
-/// Blackman-windowed sinc has 24 source frames (0.5 ms) lookahead, a 0.96-Nyquist
-/// cutoff, per-phase unity DC gain, and coefficient interpolation between phases.
-/// Stereo shares a continuous source position across calls. The queue adds its own
-/// target / 48000 seconds latency; lookahead is INCLUDED in that reservoir.
+/// Blackman-windowed sinc has 24 source frames (0.5 ms at 48 kHz) lookahead, a
+/// 0.96-Nyquist cutoff, per-phase unity DC gain, and coefficient interpolation between
+/// phases. Stereo shares a continuous source position across calls. The queue adds its
+/// own target / sampleRate seconds latency; lookahead is INCLUDED in that reservoir.
+/// The correction is at most ±2000 ppm, so the fixed 48-tap kernel remains adequate at
+/// every supported pipeline rate; only the reservoir and time steps scale.
 ///
 /// Ratio is 1 + correctionPPM / 1e6, limited to [0.998, 1.002], slew 100 ppm/s.
 /// Underflow returns a valid prefix, then forgets all local history/lookahead and
@@ -67,7 +75,11 @@ struct AdaptiveClockDriftController {
 final class AdaptiveStereoResampler {
   // Covers startup at either limiting skew and ±1000 ppm reversals with the
   // deliberately gentle clock slew. Smaller laboratory reservoirs may rebuffer.
-  static let minimumRecommendedTargetFrames = 2048
+  /// 42.7 ms at the pipeline rate (2048 frames at 48 kHz).
+  static func minimumRecommendedTargetFrames(forSampleRate rate: Double) -> Int {
+    guard rate.isFinite, rate > 0 else { return 2048 }
+    return max(256, Int((0.0426666667 * rate).rounded()))
+  }
   private static let taps = 48
   private static let phases = 1024
   private static let history = 23
@@ -75,12 +87,13 @@ final class AdaptiveStereoResampler {
   private let ring: FloatRingBuffer
   private let targetFrames: Int
   private let maximumOutputFrames: Int
+  private let sampleRate: Double
   private let sourceCapacity: Int
   private let source: UnsafeMutablePointer<Float>
   private let coefficients: UnsafeMutablePointer<Float>
   private var storedFrames = AdaptiveStereoResampler.history
   private var position = Double(AdaptiveStereoResampler.history)
-  private var controller = AdaptiveClockDriftController()
+  private var controller: AdaptiveClockDriftController
   private(set) var isPriming = true
   private(set) var rebufferCount: UInt64 = 0
 
@@ -90,13 +103,19 @@ final class AdaptiveStereoResampler {
 
   var correctionPPM: Double { controller.correctionPPM }
 
-  init(ring: FloatRingBuffer, targetFrames: Int, maximumOutputFrames: Int) {
+  init(
+    ring: FloatRingBuffer, targetFrames: Int, maximumOutputFrames: Int,
+    sampleRate: Double = 48_000
+  ) {
     precondition(targetFrames > 0 && maximumOutputFrames > 0)
+    precondition(sampleRate.isFinite && sampleRate >= 8_000 && sampleRate <= 768_000)
     // Also bound constructor arithmetic before converting floating-point to Int.
     precondition(maximumOutputFrames <= (Int.max - 128) / 4)
     precondition(targetFrames <= Int.max - maximumOutputFrames)
     self.ring = ring
     self.targetFrames = max(targetFrames, Self.lookahead + 1)
+    self.sampleRate = sampleRate
+    controller = AdaptiveClockDriftController(sampleRate: sampleRate)
     self.maximumOutputFrames = maximumOutputFrames
     sourceCapacity = Int(ceil(Double(maximumOutputFrames) * 1.002)) + Self.taps + 2
     source = .allocate(capacity: sourceCapacity * 2)

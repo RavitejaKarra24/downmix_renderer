@@ -17,8 +17,13 @@ struct EngineDiagnostics: Sendable, Equatable {
   var isPriming: Bool = false
   var correctionPPM: Double = 0
   var rebufferCount: UInt64 = 0
+  /// Pipeline rate of the run that produced these counters.
+  var sampleRate: Double = 48_000
 
-  var queueLatencyMs: Double { Double(queuedFrames) / 48 }
+  var queueLatencyMs: Double {
+    let rate = sampleRate.isFinite && sampleRate > 0 ? sampleRate : 48_000
+    return Double(queuedFrames) / (rate / 1_000)
+  }
   static let empty = EngineDiagnostics()
 }
 
@@ -100,7 +105,7 @@ final class AudioDiagnostics: Sendable {
       expected: error, desired: 0, ordering: .acquiringAndReleasing)
   }
 
-  func snapshot(requested: Int, input: Int, output: Int) -> EngineDiagnostics {
+  func snapshot(requested: Int, input: Int, output: Int, sampleRate: Double) -> EngineDiagnostics {
     EngineDiagnostics(
       underrunCount: underruns.load(ordering: .relaxed),
       overrunCount: overruns.load(ordering: .relaxed),
@@ -115,7 +120,8 @@ final class AudioDiagnostics: Sendable {
       driftCorrectionEnabled: driftEnabled.load(ordering: .relaxed),
       isPriming: priming.load(ordering: .relaxed),
       correctionPPM: Double(correctionMilliPPM.load(ordering: .relaxed)) / 1000,
-      rebufferCount: rebufferEvents.load(ordering: .relaxed)
+      rebufferCount: rebufferEvents.load(ordering: .relaxed),
+      sampleRate: sampleRate
     )
   }
 }

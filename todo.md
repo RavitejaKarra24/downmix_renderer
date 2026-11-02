@@ -4,8 +4,8 @@ Source: `future.md`. This is the active checklist; that file also contains histo
 
 ## Scope
 
-- Keep native, local-only 9.1.6 → stereo rendering, the ADC2 matrix, a 48 kHz internal DSP, macOS 15 support, ad-hoc signing and the BlackHole workflow. Follow the input device's rate (converted internally) instead of requiring 48 kHz.
-- Prioritize audio safety, reliable controls and measured efficiency. Never change system routing/settings or silently select another output.
+- Keep native, local-only 9.1.6 → stereo rendering, the ADC2 matrix, macOS 15 support, ad-hoc signing and the BlackHole workflow. Render at the input device's rate (native passthrough), with 48 kHz only as the output-device fallback.
+- Prioritize audio safety, reliable controls and measured efficiency. Never change system routing or silently select another output. The selected input device's sample rate may follow Music only through the explicit, default-on, opt-out "Match Apple Music's track rate" setting.
 - No new accessibility features or accessibility-specific release qualification, per owner request. Existing native behavior and AX hooks remain: the hooks also exercise ordinary controls in automated tests.
 - Do not redo completed engineering, redesign the UI or add effects without a demonstrated need.
 
@@ -64,6 +64,33 @@ Source: `future.md`. This is the active checklist; that file also contains histo
 - [x] Add a rotating local diagnostic log (failures with counters, sessions, rate changes, heartbeat, fatal-signal markers, unclean-exit detection) with menu/Advanced/Settings access.
 - [x] Cover rate/width reopen, content layouts (stereo/5.1/7.1/9.1/9.1.6), converter quality and log behavior in the automated suites; verify real BlackHole → engine → loopback audio at 44.1/48/96 kHz.
 
+### Music rate matching (1.5.0, build 7)
+
+- [x] Read Music's current track rate through AppleScript (no launch of Music, adaptive polling, playerInfo notification, automation-denied handling).
+- [x] Request the running input device's rate on the worker queue; only advertised rates; never the output or keep-alive; the existing watchdog reopens the input.
+- [x] Opt-out preference, Settings toggle with live status, and a Setup Checklist row (waiting/pending/verified/Automation remedy).
+- [x] HAL coverage for request/reopen/refusal/stopped/keep-alive; lifecycle coverage for parsing, monitor lifecycle, dedup and checklist states; real-hardware 44.1→48 chain verification.
+- [x] Ship `NSAppleEventsUsageDescription` and require it in the archive gate.
+
+### Native-rate passthrough (1.6.0, build 8)
+
+- [x] Rate-parameterised DSP (LFE coefficients, 3.5833 ms scaled dry delay, delay storage for 768 kHz) with history reset on rate change.
+- [x] Rate-aware reservoir (42.7 ms), drift-controller timing, queue latency and diagnostics.
+- [x] Engine passthrough: DSP/input/output at the source rate; output device set to match; full-pipeline reopen on rate/width changes; output-first start.
+- [x] Fallback to 48/44.1 kHz with an explicit **output limit** status when the DAC refuses the rate.
+- [x] DSP tests at 44.1–384 kHz, HAL passthrough/limit/keep-alive coverage, real-hardware 96 kHz stability (0 overruns/underruns after settling).
+
+### Rate-switch distortion fix (1.6.1, build 9)
+
+- [x] Confirm persistent 48 kHz starvation in installed logs; reproduce transition starvation with Music/FIIO on the old binary.
+- [x] Dispose/recreate both AUHAL instances on format changes; renegotiate through normal setup, preserve diagnostics and one-way cancellation safety.
+- [x] Clocked valid-output regression with an adversarial stale rate cache, repeated returns to 48 kHz, replacement failure and cancellation coverage.
+- [x] Six-step real-device A/B: fresh units eliminate settled underruns/overruns, including all three 48 kHz windows.
+- [x] Two one-minute settled 48 kHz windows with real Music input/FIIO output and intervening rate changes: no new underruns/overruns, stable queue and clock correction. Named-track selection failed; manual-rate transport testing only.
+- [x] Full release suites, rendered UI and isolated HAL Thread Sanitizer checks pass.
+- [x] Universal archive verified; installed 1.6.1 (9). User granted microphone access and played Deva Deva: automatic 44.1→48 kHz matching moved BlackHole, DSP and FIIO to 48 kHz with a stable 2,048-frame queue.
+- [x] User confirms physical-output listening is clear: “now it is good”.
+
 ## Feasible follow-through in this session
 
 - [x] Extract/deduplicate the plan into this checklist and explicitly stop unnecessary scope.
@@ -104,6 +131,10 @@ export SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk
 - [ ] Change device sample rates, sleep/wake, reconnect USB/Bluetooth and test hardware refusing the requested buffer size. (Rate switching through the real engine is now hardware-verified; sleep/wake, USB/Bluetooth and buffer refusal remain.)
 - [ ] Listen through a rate switch on the physical output and decide whether the ~0.25 s re-prime gap needs smoothing (crossfade/hold-last) or is acceptable at track boundaries.
 - [ ] Confirm the diagnostic log on a real abrupt stop (forced quit, power loss) and after rotation on a long-running session.
+- [ ] Allow and deny the real Automation prompt for Music control; confirm matching stops and the checklist explains each case.
+- [ ] Listen through a full 96 kHz session on the FIIO (Music matching → BlackHole 96 kHz → DSP 96 kHz → FIIO 96 kHz); confirm the DAC's rate indicator and no dropouts at track boundaries.
+- [ ] Import the 96 kHz albums into Music (no copy) if they are not matched, so matching can read their rate.
+- [ ] Profile the DSP at 192/384 kHz on the real machine and confirm the rate-switch transient is acceptable.
 - [ ] Confirm unsafe aggregate/BlackHole feedback routes are rejected on real devices.
 - [ ] Play all bed channels at known levels; verify speaker mapping, system playback routing, silence, loud LFE, gain/swap and clipping safely. (Matrix sums for stereo/5.1/7.1/9.1/9.1.6 at 44.1/48/96 kHz were hardware-verified through a captured loopback; speaker mapping and physical listening remain.)
 - [ ] Listen for resampler artifacts and run multiple-hour playback on the devices actually used; record glitches and final counters. Offline virtual hours do not complete this item.

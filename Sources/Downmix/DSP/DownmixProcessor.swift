@@ -2,11 +2,25 @@ import Foundation
 
 /// Real-time 9.1.6 bed → stereo processor matching peqdb ADC2-direct matrix.
 struct DownmixProcessor: Sendable {
-  static let sampleRate: Double = 48_000
+  /// Rate used when no caller overrides it (and the app's fallback when a DAC cannot
+  /// accept the input rate).
+  static let defaultSampleRate: Double = 48_000
+  /// Pipeline rates the processor accepts. The engine only selects a rate the input and
+  /// output devices both advertise.
+  static let supportedSampleRates = 8_000.0...768_000.0
   /// Fixed ADC2 LFE coefficient recovered from the original renderer binary.
   static let lfeCoefficient = 2.26464431
-  /// Dry-path delay used when Butterworth LFE low-pass is enabled (original default).
-  static let butterworthDryDelaySamples = 172
+  /// Dry-path delay used when Butterworth LFE low-pass is enabled, in seconds. The
+  /// original renderer used 172 samples at 48 kHz (3.5833 ms); the sample count scales
+  /// with the pipeline rate so the alignment stays constant in time.
+  static let butterworthDryDelaySeconds = 172.0 / 48_000.0
+
+  /// Samples of dry-path delay for a pipeline rate. Buffer storage is sized for
+  /// `supportedSampleRates.upperBound`.
+  static func dryDelaySamples(forSampleRate rate: Double) -> Int {
+    guard rate.isFinite, rate > 0 else { return 172 }
+    return max(1, Int((butterworthDryDelaySeconds * rate).rounded()))
+  }
 
   struct Configuration: Sendable, Equatable {
     var channelMap: [Int] = Array(1...16)  // 1-based device channels for each bed slot
@@ -14,6 +28,9 @@ struct DownmixProcessor: Sendable {
     var lfeLowpass: Bool = true
     var swapOutputs: Bool = false
     var inputChannelCount: Int = 16
+    /// Pipeline rate. The downmix matrix is rate-independent; the LFE filter and the
+    /// matched dry delay are derived from this value.
+    var sampleRate: Double = DownmixProcessor.defaultSampleRate
   }
 
   /// Fixed-size callback payload. Construct on the control side, not in a callback.
@@ -23,6 +40,10 @@ struct DownmixProcessor: Sendable {
     let lfeLowpass: Bool
     let swapOutputs: Bool
     let inputChannelCount: Int
+    let sampleRate: Double
+    let dryDelaySamples: Int32
+    let lfeA: BiquadCoefficients
+    let lfeB: BiquadCoefficients
 
     init(_ configuration: Configuration) {
       var map = SIMD16<Int32>(repeating: 0)
@@ -39,6 +60,15 @@ struct DownmixProcessor: Sendable {
       lfeLowpass = configuration.lfeLowpass
       swapOutputs = configuration.swapOutputs
       inputChannelCount = configuration.inputChannelCount
+      // Coeffients are computed here, on the control side, never in a callback.
+      let rate =
+        configuration.sampleRate.isFinite
+          && DownmixProcessor.supportedSampleRates.contains(configuration.sampleRate)
+        ? configuration.sampleRate : DownmixProcessor.defaultSampleRate
+      sampleRate = rate
+      dryDelaySamples = Int32(DownmixProcessor.dryDelaySamples(forSampleRate: rate))
+      lfeA = BiquadDesign.lowPass(freq: 125, q: 0.541196100146197, sampleRate: rate)
+      lfeB = BiquadDesign.lowPass(freq: 125, q: 1.3065629648763766, sampleRate: rate)
     }
   }
 
@@ -47,8 +77,10 @@ struct DownmixProcessor: Sendable {
   private var lfeFilterA = BiquadFilter()
   private var lfeFilterB = BiquadFilter()
   private var dryDelayIndex = 0
-  // Allocated before callbacks. Keep the processor single-owned: do not copy or
-  // share it during callbacks, which would trigger Array copy-on-write here.
+  private var dryDelayLength = 172
+  // Allocated before callbacks and sized for the maximum supported rate, so a rate
+  // change never allocates. Keep the processor single-owned: do not copy or share it
+  // during callbacks, which would trigger Array copy-on-write here.
   private var stereoDelayL: [Double]
   private var stereoDelayR: [Double]
 
@@ -59,9 +91,9 @@ struct DownmixProcessor: Sendable {
   private var clipR = false
 
   init() {
-    stereoDelayL = [Double](repeating: 0, count: Self.butterworthDryDelaySamples)
-    stereoDelayR = [Double](repeating: 0, count: Self.butterworthDryDelaySamples)
-    rebuildLFE()
+    let maximumDelay = Self.dryDelaySamples(forSampleRate: Self.supportedSampleRates.upperBound)
+    stereoDelayL = [Double](repeating: 0, count: maximumDelay)
+    stereoDelayR = [Double](repeating: 0, count: maximumDelay)
     apply(realtimeConfiguration: configuration)
   }
 
@@ -75,8 +107,13 @@ struct DownmixProcessor: Sendable {
       self.configuration.lfeLowpass != configuration.lfeLowpass
       || self.configuration.channelMap != configuration.channelMap
       || self.configuration.inputChannelCount != configuration.inputChannelCount
+      || self.configuration.sampleRate != configuration.sampleRate
     self.configuration = configuration
     masterGain = pow(10.0, configuration.preampDb / 20.0)
+    lfeFilterA.coefficients = configuration.lfeA
+    lfeFilterB.coefficients = configuration.lfeB
+    dryDelayLength = min(
+      stereoDelayL.count, max(1, Int(configuration.dryDelaySamples)))
     if resetHistory {
       lfeFilterA.reset()
       lfeFilterB.reset()
@@ -129,7 +166,7 @@ struct DownmixProcessor: Sendable {
     let swap = configuration.swapOutputs
     let invSqrt2 = 0.7071067811865476
     let lfeCoef = Self.lfeCoefficient
-    let delayCount = stereoDelayL.count
+    let delayCount = dryDelayLength
 
     for frame in 0..<frameCount {
       let frameOffset = frame * inputChannelCount
@@ -263,14 +300,6 @@ struct DownmixProcessor: Sendable {
     return Double(sample)
   }
 
-  private mutating func rebuildLFE() {
-    let f = 125.0
-    let sr = Self.sampleRate
-    lfeFilterA.coefficients = BiquadDesign.lowPass(freq: f, q: 0.541196100146197, sampleRate: sr)
-    lfeFilterB.coefficients = BiquadDesign.lowPass(freq: f, q: 1.3065629648763766, sampleRate: sr)
-    lfeFilterA.reset()
-    lfeFilterB.reset()
-  }
 }
 
 /// POD mailbox payload. Peaks are linear so dB conversion also stays off callbacks.

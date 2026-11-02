@@ -29,6 +29,8 @@ check_key LSMinimumSystemVersion "$MACOS_MIN_VERSION"
 check_key SourceDigest "$("$ROOT/Scripts/source_digest.sh")"
 DESCRIPTION="$(/usr/libexec/PlistBuddy -c 'Print :NSMicrophoneUsageDescription' "$PLIST")"
 [[ -n "$DESCRIPTION" ]] || { echo 'Archive lacks microphone permission guidance' >&2; exit 1; }
+AUTOMATION="$(/usr/libexec/PlistBuddy -c 'Print :NSAppleEventsUsageDescription' "$PLIST")"
+[[ -n "$AUTOMATION" ]] || { echo 'Archive lacks Music automation guidance' >&2; exit 1; }
 BINARY="$APP/Contents/MacOS/$APP_NAME"
 ARCHES="$(/usr/bin/lipo -archs "$BINARY")"
 for arch in arm64 x86_64; do

@@ -1,6 +1,6 @@
 import Foundation
 
-struct BiquadCoefficients: Sendable, Equatable {
+struct BiquadCoefficients: Sendable, Equatable, BitwiseCopyable {
   var b0: Double
   var b1: Double
   var b2: Double

@@ -116,6 +116,13 @@ final class DelayedWorker: AudioEngineWorker, @unchecked Sendable {
     }
   }
 
+  func requestInputSampleRate(_ rate: Double) {
+    dispatchPrecondition(condition: .onQueue(queue))
+    probe.state.withLock {
+      $0.events.append("rate-\(Int(rate))")
+    }
+  }
+
   func stop() {
     dispatchPrecondition(condition: .onQueue(queue))
     gate?.close()

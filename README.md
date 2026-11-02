@@ -92,21 +92,48 @@ If your device list is long, use the filter box. You can pin the devices you use
 their right-click menu and drag them into the order you like.
 
 **Setup Checklist** explains the selected devices, their live sample rates, permission, the
-installed speaker layout, and manual routing
-requirements. Device rates do not have to be 48 kHz: Downmix follows the rate your player or
-sample-rate switcher gives the input device, converts it to its internal 48 kHz, and lets
-Core Audio convert the stereo mix to the output device's rate. Apple Music moving BlackHole
-between 44.1, 48 and 96 kHz no longer stops rendering; a brief re-prime follows the switch. **Advanced** shows buffer negotiation and current-run diagnostics. Queue latency
+installed speaker layout, Music rate matching, and manual routing
+requirements. Device rates do not have to be 48 kHz: Downmix follows the input device's
+rate, runs its DSP at that rate, and sets the output device to match — so 44.1 kHz in goes to
+the DAC at 44.1 kHz, 96 kHz at 96 kHz. Apple Music moving BlackHole between 44.1, 48 and
+96 kHz no longer stops rendering; a brief re-prime follows the switch. **Advanced** shows
+buffer negotiation and current-run diagnostics. Queue latency
 is only the audio waiting inside Downmix, not your total listening latency.
 Small differences between the two device clocks are corrected automatically.
 This uses a reservoir of at least **42.7 ms**, increasing with larger device buffers;
-initial priming is silent. Rates between 8 kHz and 768 kHz are accepted; the input is
-converted internally to 48 kHz and the output keeps a 48 kHz client format.
+initial priming is silent. Rates between 8 kHz and 768 kHz are accepted; the DSP and the
+output device run at the input rate whenever the DAC accepts it (48 kHz otherwise).
 Device setup and cleanup run in the background; Stop mutes future callbacks without
 waiting for cleanup (already-buffered hardware audio may finish).
 
 After an error, reconnect the saved devices and use **Retry** (⌘⇧R). Retry never picks a
 different output automatically. Failure counters remain visible until a new run or an explicit stop.
+
+### Sample rates and 96 kHz files
+
+macOS gives every audio device **one** nominal sample rate at a time, and Music does not
+switch it per track. If BlackHole is at 48,000 Hz while you play a 96 kHz file, macOS
+converts it to 48 kHz before Downmix ever receives it: Downmix correctly shows 48 kHz, and
+it cannot see the file's own rate through Core Audio.
+
+Downmix can follow Music for you. **Settings → Audio → Match Apple Music's track rate**
+(on by default) reads the current Music track's rate, sets the **selected input device** to
+it, and sets the **selected output device** to the same rate. The whole pipeline — input,
+DSP and output — then runs at the same nominal rate, without a fixed 48 kHz conversion.
+Small adaptive resampling still compensates for independent device clocks; this is not
+bit-perfect playback. Both audio units are recreated for a rate switch so stale device-side
+timing cannot cause ongoing dropouts. System routing is never touched.
+
+- The first time it runs, macOS asks whether Downmix may control Music. Allow it in
+  **System Settings → Privacy & Security → Automation**; denying it only disables matching.
+- Music reports a rate for Apple Music streams and tracks in your library. A file opened
+  outside the library may not report one — add the folder to Music
+  (**File → Add to Library**, with "Copy files to library" off) to get native-rate playback.
+- The DSP runs at the input rate, so a 96 kHz track is downmixed at 96 kHz and the DAC
+  receives 96 kHz. If the output device cannot accept the input rate, Downmix renders at
+  48 kHz and the status line says **output limit** (an explicit nominal-rate conversion).
+- With matching off, set the device rate yourself in **Audio MIDI Setup** (for example
+  96,000 Hz); Downmix follows it and sets the output device to match.
 
 ## Updating
 
@@ -165,10 +192,22 @@ does not start audio. Audio-route **Retry** is separate.
 **It says microphone access is required.** Enable **Downmix** in **System Settings →
 Privacy & Security → Microphone**, then retry **Start**.
 
-**A rate switch made the sound drop out briefly.** When Apple Music (or a sample-rate
-switcher such as LosslessSwitcher or SampleRateSwitcher) changes the input device's rate,
-Downmix reopens only its input and continues rendering. The output keeps playing buffered
-audio and then re-primes for roughly a quarter of a second. A track change hides this gap.
+**A rate switch made the sound drop out briefly.** When Music rate matching (or another
+sample-rate switcher, or you in Audio MIDI Setup) changes the input device's rate, Downmix
+reopens the input and output at the new rate and continues rendering. The output keeps
+playing buffered audio and then re-primes for roughly a quarter of a second. A track change
+hides this gap.
+
+**It still shows 48 kHz for my 96 kHz files.** Check the Setup Checklist row **Music rate
+matching**: it shows the rate Music reported and the input device's current rate. Matching
+needs the track to be in the Music library, and it also needs Automation permission. With
+matching off, or for another player, set the rate in Audio MIDI Setup yourself. If the
+status says **output limit**, the DAC refused the source rate and Downmix fell back to
+48 kHz.
+
+**macOS asks whether Downmix may control Music.** That is how the track rate is read. Allow
+it in **System Settings → Privacy & Security → Automation**; refusing it only turns off
+automatic rate matching.
 
 **It says the input or output rate is not supported.** Rates from 8 kHz to 768 kHz are
 accepted. Set the device to a normal rate such as 44,100 or 48,000 Hz in **Audio MIDI
@@ -196,7 +235,9 @@ Open it from **Transport → Show Diagnostic Log**, **Advanced → Show diagnost
 ## Privacy
 
 Downmix processes audio entirely on your Mac. It has no network code and sends nothing
-anywhere. It does not change your system sound settings — you choose those yourself in
+anywhere. It changes two system audio settings only when **Match Apple Music's track rate**
+is on: the **selected input and output devices'** nominal sample rates, so both follow the
+track. It never changes the default output or your routing — you choose those yourself in
 System Settings. Its own settings live in a single file at
 `~/Library/Application Support/Downmix/preferences.json`; its diagnostic log stays in
 `~/Library/Logs/Downmix/`.
@@ -311,8 +352,11 @@ GitHub Releases instead of committing it.
 
 ## DSP notes
 
-- Internal DSP rate **48 kHz**; input device rate is followed and converted (8–768 kHz),
-  output keeps a 48 kHz client format that Core Audio converts to the device
+- Passthrough: the DSP runs at the input device's rate (8–768 kHz); the output device and
+  client format follow it, so 44.1/48/96/192 kHz sources are not resampled. 48 kHz is the
+  fallback when the output device refuses the rate.
+- Optional input-device rate matching from Music's current track (AppleScript, opt-out in
+  Settings); it sets both the input and output device rates.
 - Bed order: `L R C LFE Ls Rs Lrs Rrs Lw Rw Ltf Rtf Ltm Rtm Ltr Rtr`
 - Center: `-3 dB` to both sides (`0.7071`)
 - Surround/height: hard-panned L/R
@@ -335,9 +379,11 @@ hardware-profiled; see [profiling instructions](docs/profiling.md) rather than a
 
 ## Limitations
 
-- Input rates outside 8–768 kHz are rejected. A live rate or channel-width switch reopens only
-  the input unit, which costs a brief (~0.25 s) audible gap while the reservoir re-primes.
+- Input rates outside 8–768 kHz are rejected. A live rate or channel-width switch reopens
+  both units, which costs a brief (~0.25 s) audible gap while the reservoir re-primes.
 - Input devices narrower than 16 channels render only the bed slots they expose.
+- Automatic rate matching reads Music only. Other players report no rate, so use Audio MIDI
+  Setup (or a switcher) for those; Downmix still follows whatever rate they set.
 - Configuration/meters now use preallocated POD mailboxes instead of a shared DSP lock.
   Off-main setup/teardown and bounded independent-device clock correction are implemented.
   Runtime Instruments/CPU profiling and hardware qualification remain pending in

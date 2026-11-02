@@ -27,6 +27,7 @@ final class InputRateConverter {
   }
 
   let deviceRate: Double
+  let outputRate: Double
   let channelCount: Int
   /// Output frames per input frame when fully primed.
   let ratio: Double
@@ -35,15 +36,19 @@ final class InputRateConverter {
   private let feed = Feed()
   private let feedPointer: UnsafeMutableRawPointer
 
-  /// `nil` when the rate already matches: no converter, no added latency or CPU.
-  init?(deviceRate: Double, channelCount: Int) {
+  /// `nil` when the rates already match: no converter, no added latency or CPU.
+  init?(
+    deviceRate: Double, channelCount: Int,
+    outputRate: Double = InputRateConverter.outputSampleRate
+  ) {
     guard deviceRate.isFinite, Self.supportedDeviceRates.contains(deviceRate),
+      outputRate.isFinite, Self.supportedDeviceRates.contains(outputRate),
       channelCount > 0, channelCount <= 512
     else { return nil }
-    guard deviceRate != Self.outputSampleRate else { return nil }
+    guard deviceRate != outputRate else { return nil }
 
     var input = Self.format(rate: deviceRate, channels: channelCount)
-    var output = Self.format(rate: Self.outputSampleRate, channels: channelCount)
+    var output = Self.format(rate: outputRate, channels: channelCount)
     var created: AudioConverterRef?
     guard AudioConverterNew(&input, &output, &created) == noErr, let created else {
       return nil
@@ -56,8 +61,9 @@ final class InputRateConverter {
 
     self.converter = created
     self.deviceRate = deviceRate
+    self.outputRate = outputRate
     self.channelCount = channelCount
-    ratio = Self.outputSampleRate / deviceRate
+    ratio = outputRate / deviceRate
     feed.channels = channelCount
     feedPointer = Unmanaged.passUnretained(feed).toOpaque()
   }

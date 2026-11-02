@@ -87,6 +87,7 @@ private final class NotificationObservation {
 struct SetupCheck: Identifiable, Equatable {
   enum ID: String {
     case input, inputRate, outputRate, output, authorization, speakerMapping, systemOutput
+    case musicRate
   }
 
   enum Status: String {
@@ -139,6 +140,12 @@ final class AppState {
   @ObservationIgnored private var deviceMonitor: AudioDeviceMonitor?
   @ObservationIgnored private var notificationObservers: [NotificationObservation] = []
   @ObservationIgnored private let log: any DiagnosticLogging
+  @ObservationIgnored private let musicRateMonitor: (any MusicRateMonitoring)?
+  @ObservationIgnored private var isMonitoringMusicRate = false
+  @ObservationIgnored private var lastRequestedMusicRate: Double?
+  /// Last rate Music reported for its current track, for the checklist and log.
+  private(set) var detectedMusicRate: Double?
+  private(set) var musicRateFailure: MusicRateFailure?
   @ObservationIgnored private var heartbeatTask: Task<Void, Never>?
   @ObservationIgnored private var lastLoggedDevices: String?
   @ObservationIgnored private var saveTask: Task<Void, Never>?
@@ -163,7 +170,8 @@ final class AppState {
     routeSafetyProvider: ((AudioDeviceInfo, String) -> Bool)? = nil,
     preferenceWriter: @escaping (AppPreferences) throws -> Void = { try $0.save() },
     installListeners: Bool = true,
-    log: any DiagnosticLogging = DownmixLog.shared
+    log: any DiagnosticLogging = DownmixLog.shared,
+    musicRateMonitor: (any MusicRateMonitoring)? = nil
   ) {
     self.engine = engine
     self.preferences = preferences
@@ -179,6 +187,7 @@ final class AppState {
     self.routeSafetyProvider = routeSafetyProvider
     self.preferenceWriter = preferenceWriter
     self.log = log
+    self.musicRateMonitor = musicRateMonitor
     engine.setStatusHandler { [weak self] update in
       // The UI bridge delivers logical intents synchronously and generation-filtered
       // worker snapshots on main, never from a render callback.
@@ -264,18 +273,24 @@ final class AppState {
           status: rateSupported ? .verified : .needsAttention,
           guidance: input.map { device in
             rateSupported
-              ? Self.conversionText(device.nominalSampleRate, direction: "converted to 48 kHz")
+              ? Self.inputRateGuidance(
+                deviceRate: device.nominalSampleRate, renderRate: status.renderSampleRate)
               : "\(Self.rateText(device.nominalSampleRate)) is outside the supported 8–768 kHz band."
           } ?? "Select an input to read its sample rate."),
         SetupCheck(
           id: .outputRate, title: "Output format",
           status: outputRateSupported ? .verified : .needsAttention,
           guidance: output.map { device in
-            outputRateSupported
-              ? Self.conversionText(
-                device.nominalSampleRate, direction: "the stereo mix renders at 48 kHz")
-              : "The selected output reports no usable sample rate."
+            guard outputRateSupported else {
+              return "The selected output reports no usable sample rate."
+            }
+            let deviceText = Self.rateText(device.nominalSampleRate)
+            guard let render = status.renderSampleRate else {
+              return "\(deviceText): the stereo mix follows this rate while rendering."
+            }
+            return "\(deviceText): the stereo mix renders at \(Self.rateText(render))."
           } ?? "Select an output to read its sample rate."),
+        musicRateSetupCheck(input: input),
         SetupCheck(
           id: .output, title: "Safe stereo output",
           status: outputReady ? .verified : .needsAttention,
@@ -320,13 +335,78 @@ final class AppState {
     }
   }
 
+  /// Reports whether the input device is following Music's current track rate. This is
+  /// opt-in: matching changes a system audio setting, so the app never hides it.
+  private func musicRateSetupCheck(input: AudioDeviceInfo?) -> SetupCheck {
+    let title = "Music rate matching"
+    guard preferences.matchMusicSampleRate else {
+      return SetupCheck(
+        id: .musicRate, title: title, status: .manual,
+        guidance:
+          "Off. The input keeps the rate you set in Audio MIDI Setup; turn matching on to follow Music's track rate."
+      )
+    }
+    if musicRateFailure == .automationDenied {
+      return SetupCheck(
+        id: .musicRate, title: title, status: .needsAttention,
+        guidance:
+          "Allow Downmix to control Music in System Settings → Privacy & Security → Automation, then start again."
+      )
+    }
+    if case .scriptFailed(let code) = musicRateFailure {
+      return SetupCheck(
+        id: .musicRate, title: title, status: .manual,
+        guidance:
+          "Music did not report a rate for this track (AppleScript error \(code)). Files opened outside the Music library may not expose one; set the device rate in Audio MIDI Setup."
+      )
+    }
+    guard let rate = detectedMusicRate else {
+      return SetupCheck(
+        id: .musicRate, title: title, status: .manual,
+        guidance:
+          "Play something in Music. Downmix matches the selected input to the current track; files opened outside Music may not report a rate."
+      )
+    }
+    guard InputRateConverter.supportedDeviceRates.contains(rate) else {
+      return SetupCheck(
+        id: .musicRate, title: title, status: .needsAttention,
+        guidance:
+          "Music reports \(Self.rateText(rate)), outside the supported 8–768 kHz band.")
+    }
+    guard let input else {
+      return SetupCheck(
+        id: .musicRate, title: title, status: .manual,
+        guidance: "Music reports \(Self.rateText(rate)). Select an input device to match it.")
+    }
+    if abs(input.nominalSampleRate - rate) <= 0.5 {
+      return SetupCheck(
+        id: .musicRate, title: title, status: .verified,
+        guidance:
+          "Music \(Self.rateText(rate)) · input \(Self.rateText(rate)). Downmix renders at the device rate."
+      )
+    }
+    return SetupCheck(
+      id: .musicRate, title: title, status: .manual,
+      guidance:
+        "Music \(Self.rateText(rate)) · input \(Self.rateText(input.nominalSampleRate)). Waiting for the device to switch."
+    )
+  }
+
   private static func rateText(_ rate: Double) -> String {
     guard rate.isFinite, rate > 0 else { return "No sample rate" }
     return "\(Int(rate.rounded())) Hz"
   }
 
-  private static func conversionText(_ rate: Double, direction: String) -> String {
-    "\(rateText(rate)): \(direction)."
+  private static func inputRateGuidance(deviceRate: Double, renderRate: Double?) -> String {
+    let deviceText = rateText(deviceRate)
+    guard let renderRate else {
+      return "\(deviceText): the stereo mix renders at this rate when the output supports it."
+    }
+    if abs(renderRate - deviceRate) <= 0.5 {
+      return "\(deviceText) in, rendered at \(Self.rateText(renderRate)) with no conversion."
+    }
+    return
+      "\(rateText(deviceRate)): the output device cannot accept it, so the mix renders at \(rateText(renderRate))."
   }
 
   /// Logs the saved configuration once at launch, before any device is opened.
@@ -358,6 +438,77 @@ final class AppState {
     let rate = Int(device.nominalSampleRate.rounded())
     return "\(device.name)[\(device.id) \(device.inputChannelCount)in/"
       + "\(device.outputChannelCount)out \(rate)Hz]"
+  }
+
+  /// Starts/stops Music rate polling with the renderer and the preference. Safe to call
+  /// on every status publication: the monitor ignores a redundant start.
+  private func syncMusicRateMonitoring() {
+    let shouldMonitor = preferences.matchMusicSampleRate && isRunning && !isKeepingOutputAwake
+    guard shouldMonitor != isMonitoringMusicRate else { return }
+    isMonitoringMusicRate = shouldMonitor
+    guard shouldMonitor else {
+      musicRateMonitor?.stop()
+      detectedMusicRate = nil
+      musicRateFailure = nil
+      lastRequestedMusicRate = nil
+      return
+    }
+    musicRateMonitor?.start { [weak self] observation in
+      MainActor.assumeIsolated { self?.receiveMusicRate(observation) }
+    }
+  }
+
+  private func receiveMusicRate(_ observation: MusicRateObservation) {
+    switch observation {
+    case .playing(let rate, let track):
+      if detectedMusicRate != rate {
+        log.log(
+          .info, "music",
+          "track=\(track.isEmpty ? "-" : track) reportedRate=\(Int(rate.rounded()))Hz")
+      }
+      detectedMusicRate = rate
+      musicRateFailure = nil
+      applyDetectedMusicRate(rate)
+    case .idle:
+      if detectedMusicRate != nil {
+        log.log(.info, "music", "Music is not playing; leaving the input rate unchanged")
+      }
+      detectedMusicRate = nil
+      musicRateFailure = nil
+      lastRequestedMusicRate = nil
+    case .failure(let failure):
+      if musicRateFailure != failure {
+        log.log(.warning, "music", "rate reading failed: \(Self.describe(failure))")
+      }
+      musicRateFailure = failure
+    }
+  }
+
+  /// Requests the running input device's rate. The worker reopens the pipeline when the
+  /// HAL applies it; the output device follows the source rate.
+  private func applyDetectedMusicRate(_ rate: Double) {
+    guard preferences.matchMusicSampleRate, status.phase == .running,
+      let input = inputDevices.first(where: { $0.id == selectedInputID })
+    else { return }
+    guard InputRateConverter.supportedDeviceRates.contains(rate) else { return }
+    if abs(input.nominalSampleRate - rate) <= 0.5 {
+      lastRequestedMusicRate = nil
+      return
+    }
+    guard lastRequestedMusicRate != rate else { return }
+    lastRequestedMusicRate = rate
+    engine.setInputSampleRate(rate)
+    log.log(
+      .info, "music",
+      "requested input=\(Self.deviceSummary(input)) rate=\(Int(rate.rounded()))Hz")
+  }
+
+  private static func describe(_ failure: MusicRateFailure) -> String {
+    switch failure {
+    case .musicNotRunning: "Music is not running"
+    case .automationDenied: "Automation permission to control Music was denied"
+    case .scriptFailed(let code): "AppleScript error \(code)"
+    }
   }
 
   func refreshDevices() {
@@ -457,6 +608,7 @@ final class AppState {
     selectedInputID = device.id
     preferences.inputDeviceUID = device.uid
     preferences.inputDeviceName = device.name
+    lastRequestedMusicRate = nil
     persist()
     if restart { start() }
   }
@@ -499,6 +651,7 @@ final class AppState {
       stopRenderer()
       startKeepAliveIfNeeded()
     }
+    syncMusicRateMonitoring()
   }
 
   func toggle() {
@@ -751,6 +904,10 @@ final class AppState {
       didHandleAutomaticStart = true
       errorMessage = update.message
     }
+    syncMusicRateMonitoring()
+    if let rate = detectedMusicRate, status.phase == .running {
+      applyDetectedMusicRate(rate)
+    }
   }
 
   /// One log line per visible status transition, plus full failure counters.
@@ -823,6 +980,7 @@ final class AppState {
     activeInputID = nil
     activeOutputID = nil
     activeFramesPerBuffer = nil
+    syncMusicRateMonitoring()
   }
 
   private func failAndStop(_ message: String) {

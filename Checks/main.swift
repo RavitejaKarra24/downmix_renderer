@@ -201,7 +201,12 @@ func checkGainClippingAndSanitization() {
 }
 
 func checkLowpassAndHistory() {
-  require(DownmixProcessor.butterworthDryDelaySamples == 172, "original dry delay")
+  require(
+    DownmixProcessor.dryDelaySamples(forSampleRate: 48_000) == 172,
+    "original 48 kHz dry delay stays 172 samples")
+  require(
+    abs(DownmixProcessor.butterworthDryDelaySeconds - 172.0 / 48_000.0) < 1e-12,
+    "dry delay is defined in time")
   var delayed = configured(.init(preampDb: 0))
   var impulse = [Float](repeating: 0, count: 16 * 400)
   impulse[0] = 0.25
@@ -472,6 +477,94 @@ func checkInputRateConversion() {
   print("PASS: 44.1/96/192/88.2/32 kHz input conversion with varied block sizes")
 }
 
+/// Passthrough: the same downmix must be correct at every pipeline rate. The matrix is
+/// rate-independent; the LFE filter and matched dry delay follow the rate.
+func checkRatePassthrough() {
+  let left = [1.0, 0, sqrt(0.5), 2.26464431, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0]
+  let right = [0.0, 1, sqrt(0.5), 2.26464431, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1]
+  for rate in [44_100.0, 48_000.0, 88_200.0, 96_000.0, 176_400.0, 192_000.0, 384_000.0] {
+    let expectedDelay = Int((DownmixProcessor.butterworthDryDelaySeconds * rate).rounded())
+    require(
+      DownmixProcessor.dryDelaySamples(forSampleRate: rate) == expectedDelay,
+      "\(rate) dry delay scales with time")
+    require(
+      DownmixProcessor.dryDelaySamples(forSampleRate: rate)
+        == Int((172.0 * rate / 48_000.0).rounded()),
+      "\(rate) dry delay matches 172 samples at 48 kHz")
+
+    // Matrix sums are rate-independent.
+    var config = DownmixProcessor.Configuration(preampDb: 0, lfeLowpass: false)
+    config.sampleRate = rate
+    var processor = configured(config)
+    let input = (0..<16).map { Float($0 + 1) * 0.001 }
+    let output = render(&processor, input)
+    requireNear(
+      output[0], zip(input, left).reduce(0) { $0 + Double($1.0) * $1.1 }, "\(rate) matrix L",
+      tolerance: 1e-5)
+    requireNear(
+      output[1], zip(input, right).reduce(0) { $0 + Double($1.0) * $1.1 }, "\(rate) matrix R",
+      tolerance: 1e-5)
+
+    // Dry delay on the LFE path.
+    var delayedConfig = DownmixProcessor.Configuration(preampDb: 0)
+    delayedConfig.sampleRate = rate
+    var delayed = configured(delayedConfig)
+    let frames = expectedDelay + 200
+    var impulse = [Float](repeating: 0, count: 16 * frames)
+    impulse[0] = 0.25
+    impulse[1] = -0.125
+    let dry = render(&delayed, impulse)
+    for frame in 0..<frames {
+      requireNear(dry[frame * 2], frame == expectedDelay ? 0.25 : 0, "\(rate) dry delay L")
+      requireNear(
+        dry[frame * 2 + 1], frame == expectedDelay ? -0.125 : 0, "\(rate) dry delay R")
+    }
+
+    // The LFE low-pass keeps its 125 Hz corner at this rate.
+    for (frequency, shouldPass) in [(30.0, true), (1000.0, false)] {
+      var lowpass = configured(delayedConfig)
+      let sineFrames = Int(rate * 0.2)
+      var sine = [Float](repeating: 0, count: 16 * sineFrames)
+      for frame in 0..<sineFrames {
+        sine[frame * 16 + 3] = Float(0.01 * sin(2 * .pi * frequency * Double(frame) / rate))
+      }
+      let filtered = render(&lowpass, sine)
+      let start = sineFrames / 2
+      let rms = sqrt(
+        (start..<sineFrames).reduce(0.0) {
+          $0 + pow(Double(filtered[$1 * 2]), 2)
+        } / Double(sineFrames - start))
+      let relative = rms / (0.01 * 2.26464431 / sqrt(2))
+      require(
+        shouldPass ? relative > 0.99 && relative < 1.01 : relative < 0.001,
+        "\(rate) LFE response at \(frequency) Hz")
+
+      // The published configuration carries the rate-derived coefficients.
+      let realtime = DownmixProcessor.RealtimeConfiguration(delayedConfig)
+      require(realtime.sampleRate == rate, "\(rate) realtime rate")
+      require(Int(realtime.dryDelaySamples) == expectedDelay, "\(rate) realtime delay")
+      require(
+        realtime.lfeA
+          == BiquadDesign.lowPass(freq: 125, q: 0.541196100146197, sampleRate: rate),
+        "\(rate) realtime LFE section A")
+      require(
+        realtime.lfeB
+          == BiquadDesign.lowPass(freq: 125, q: 1.3065629648763766, sampleRate: rate),
+        "\(rate) realtime LFE section B")
+    }
+
+    // A pipeline-rate change must clear filter and delay history, not replay it.
+    var changed = configured(delayedConfig)
+    _ = render(&changed, impulse)
+    var updated = delayedConfig
+    updated.sampleRate = rate == 48_000 ? 96_000 : 48_000
+    changed.apply(configuration: updated)
+    let silence = render(&changed, [Float](repeating: 0, count: 16 * 600))
+    require(silence.allSatisfy { $0 == 0 }, "\(rate) rate change clears history")
+  }
+  print("PASS: 44.1-384 kHz passthrough DSP (matrix, scaled delay, LFE filter, history)")
+}
+
 func writeRing(_ ring: FloatRingBuffer, _ samples: [Float], count: Int? = nil) -> Int {
   samples.withUnsafeBufferPointer { ring.write($0.baseAddress!, count: count ?? samples.count) }
 }
@@ -634,6 +727,7 @@ checkSurroundContentLayouts()
 checkInputRateConversion()
 checkGainClippingAndSanitization()
 checkLowpassAndHistory()
+checkRatePassthrough()
 checkRing()
 checkConcurrentRing()
 print("DSP/ring checks passed (\(assertions.load(ordering: .relaxed)) assertions)")

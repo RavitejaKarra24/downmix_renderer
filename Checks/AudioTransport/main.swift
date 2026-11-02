@@ -10,7 +10,7 @@ func require(_ condition: @autoclosure () -> Bool, _ message: String) {
 }
 
 func snapshot(_ diagnostics: AudioDiagnostics) -> EngineDiagnostics {
-  diagnostics.snapshot(requested: 128, input: 256, output: 512)
+  diagnostics.snapshot(requested: 128, input: 256, output: 512, sampleRate: 48_000)
 }
 
 let ring = FloatRingBuffer(capacity: 16)
@@ -265,14 +265,15 @@ for ioFrames in [32, 128, 512, 1024, 4096, 65_536] {
   let maximum = max(4096, ioFrames)
   let geometry = StereoOutputBuffering(
     inputFrames: ioFrames, outputFrames: ioFrames,
-    maximumInputFrames: maximum, maximumOutputFrames: maximum)
+    maximumInputFrames: maximum, maximumOutputFrames: maximum, sampleRate: 48_000)
   require(geometry.targetFrames >= ioFrames * 4, "reservoir covers hardware packet jitter")
   require(
     geometry.ringCapacityFrames > geometry.targetFrames + maximum * 2,
     "large supported slices can prime and absorb bursts")
 }
 let largeGeometry = StereoOutputBuffering(
-  inputFrames: 1024, outputFrames: 1024, maximumInputFrames: 4096, maximumOutputFrames: 4096)
+  inputFrames: 1024, outputFrames: 1024, maximumInputFrames: 4096, maximumOutputFrames: 4096,
+  sampleRate: 48_000)
 let largeRing = FloatRingBuffer(capacity: largeGeometry.ringCapacityFrames * 2)
 let largeDiagnostics = AudioDiagnostics()
 let largeRenderer = StereoOutputRenderer(

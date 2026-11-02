@@ -21,9 +21,12 @@ struct EngineStatus: Sendable, Equatable {
   /// Bed layout advertisement for the input device of this run: `nil` when the run has
   /// no 16-channel input, `false` when the HAL refused the layout change.
   var bedLayoutInstalled: Bool?
-  /// Live input format of this run. `nil` while stopped, erroring or keep-alive only.
+  /// Live input format of this run. `nil` while stopped or erroring.
   var inputSampleRate: Double?
   var inputChannelCount: Int?
+  /// Rate the DSP and stereo output client run at. Equals `inputSampleRate` for
+  /// passthrough, or the fallback when the output device refuses the input rate.
+  var renderSampleRate: Double?
 }
 
 /// Dual-device Core Audio engine: multi-channel input → DSP → stereo output.
@@ -64,9 +67,13 @@ final class AudioEngine: @unchecked Sendable {
   private var configuration = DownmixProcessor.Configuration()
   private var inputChannels = 16
   /// Client format rate of the input unit. The HAL cannot convert virtual-device
-  /// input rates, so the input follows the device and `inputRateConverter` produces
-  /// the fixed 48 kHz DSP rate.
+  /// input rates, so the input follows the device.
   private var inputDeviceRate = AudioEngine.targetSampleRate
+  /// Rate the DSP, stereo queue and output client run at. Normally the input device's
+  /// rate (passthrough); the 48 kHz default only appears when the DAC refuses it.
+  private var pipelineRate = AudioEngine.targetSampleRate
+  private var meterPublishFrames = 4_800
+  private var lastOutputRateNotice: Double?
   private var inputRateConverter: InputRateConverter?
   private var convertedInput = [Float]()
   private var maximumConvertedFrames = 0
@@ -136,12 +143,29 @@ final class AudioEngine: @unchecked Sendable {
       self.keepAliveOnly = keepAliveOnly
       let inputFormat = try validateDevices(
         inputDeviceID: inputDeviceID, outputDeviceID: outputDeviceID)
+      // Known before the rate helpers run: the output rate is set before any unit opens.
+      expectedInputDeviceID = inputDeviceID
+      expectedOutputDeviceID = outputDeviceID
       // The device, not the cached catalog, owns the live width and rate. Players and
       // sample-rate switchers can change them between catalog refreshes.
       self.inputChannels = inputFormat.channels
       self.inputDeviceRate = inputFormat.rate
+      // Passthrough: render at the input device's rate and ask the output device to
+      // match it, so no sample-rate conversion happens inside Downmix or at the output.
+      if keepAliveOnly {
+        let outputRate = DeviceManager.sampleRate(id: outputDeviceID)
+        self.pipelineRate =
+          DownmixProcessor.supportedSampleRates.contains(outputRate)
+          ? outputRate : Self.targetSampleRate
+      } else {
+        self.pipelineRate = resolvePipelineRate(
+          inputRate: inputFormat.rate, outputDeviceID: outputDeviceID)
+        self.pipelineRate = applyOutputSampleRate(self.pipelineRate)
+      }
       self.configuration = configuration
       self.configuration.inputChannelCount = inputFormat.channels
+      self.configuration.sampleRate = pipelineRate
+      self.meterPublishFrames = Self.meterFrames(forSampleRate: pipelineRate)
       // Players downmix to stereo unless the input device advertises a layout their
       // channel map can convert. Install it before IO opens so the next client stream
       // negotiates the full bed. A refused layout is reported, never fatal.
@@ -178,7 +202,7 @@ final class AudioEngine: @unchecked Sendable {
       let unit = try makeHALUnit()
       outputUnit = unit
       expectedOutputDeviceID = outputDeviceID
-      try configureOutputUnit(unit, deviceID: outputDeviceID)
+      try configureOutputUnit(unit, deviceID: outputDeviceID, sampleRate: pipelineRate)
       maximumOutputFrames = try maximumFramesPerSlice(unit)
       guard Int(maximumInputFrames) >= negotiatedInputFrames,
         Int(maximumOutputFrames) >= negotiatedOutputFrames
@@ -186,25 +210,29 @@ final class AudioEngine: @unchecked Sendable {
         throw EngineError.setupFailed(
           "Audio unit maximum slice is smaller than the device I/O buffer")
       }
-      // Queue geometry follows the 48 kHz frames a callback produces, not the
+      // Queue geometry follows the pipeline-rate frames a callback produces, not the
       // device-rate frames the input unit receives.
       let buffering = StereoOutputBuffering(
         inputFrames: converterFrames(forDeviceFrames: negotiatedInputFrames),
         outputFrames: negotiatedOutputFrames,
         maximumInputFrames: maximumConvertedFrames,
-        maximumOutputFrames: Int(maximumOutputFrames)
+        maximumOutputFrames: Int(maximumOutputFrames),
+        sampleRate: pipelineRate
       )
       ring = keepAliveOnly ? nil : FloatRingBuffer(capacity: buffering.ringCapacityFrames * 2)
       outputRenderer = StereoOutputRenderer(
         ring: ring, diagnostics: audioDiagnostics, maximumFrames: maximumOutputFrames,
-        driftCorrection: !keepAliveOnly, targetFrames: buffering.targetFrames
+        driftCorrection: !keepAliveOnly, targetFrames: buffering.targetFrames,
+        sampleRate: pipelineRate
       )
       try verifyRoutes()
 
+      // Consumer first: the output renders priming silence while the input unit starts,
+      // instead of the producer overfilling the ring while the output initializes.
+      try startUnit(unit)
       if let inputUnit {
         try startUnit(inputUnit)
       }
-      try startUnit(unit)
 
       // Cancellation may arrive during a blocking initialize or UnitStart. Never reopen
       // the gate; dispose on this same queue immediately after setup returns.
@@ -217,7 +245,8 @@ final class AudioEngine: @unchecked Sendable {
       publish(
         phase: keepAliveOnly ? .keepAlive : .running,
         message: keepAliveOnly
-          ? "Output keep-alive running" : Self.runningMessage(inputRate: inputDeviceRate)
+          ? "Output keep-alive running"
+          : Self.runningMessage(inputRate: inputDeviceRate, renderRate: pipelineRate)
       )
       startMeterTimer()
     } catch {
@@ -239,8 +268,43 @@ final class AudioEngine: @unchecked Sendable {
     // The device owns the live input width; a cached catalog value must not make the
     // processor read past the frames its callback actually rendered.
     if !keepAliveOnly { configuration.inputChannelCount = inputChannels }
+    configuration.sampleRate = pipelineRate
     self.configuration = configuration
     configurationMailbox.publish(DownmixProcessor.RealtimeConfiguration(configuration))
+  }
+
+  /// Best-effort rate match for the running input device. The watchdog notices the new
+  /// nominal rate and recreates both units, with the selected output following it.
+  func requestInputSampleRate(_ rate: Double) {
+    dispatchPrecondition(condition: .onQueue(queue))
+    guard isRunning, !keepAliveOnly, rate.isFinite,
+      InputRateConverter.supportedDeviceRates.contains(rate)
+    else { return }
+    let deviceID = expectedInputDeviceID
+    guard deviceID != kAudioObjectUnknown else { return }
+    guard DeviceManager.sampleRate(id: deviceID) != rate else { return }
+    guard DeviceManager.isSampleRateAvailable(rate, id: deviceID) else {
+      logger.notice("Input device does not offer \(rate) Hz; keeping \(self.inputDeviceRate) Hz")
+      return
+    }
+    var address = AudioObjectPropertyAddress(
+      mSelector: kAudioDevicePropertyNominalSampleRate,
+      mScope: kAudioObjectPropertyScopeGlobal,
+      mElement: kAudioObjectPropertyElementMain
+    )
+    var settable: DarwinBoolean = false
+    guard AudioObjectIsPropertySettable(deviceID, &address, &settable) == noErr,
+      settable.boolValue
+    else {
+      logger.warning("Input device rate is not settable; keeping \(self.inputDeviceRate) Hz")
+      return
+    }
+    var value = rate
+    let status = AudioObjectSetPropertyData(
+      deviceID, &address, 0, nil, UInt32(MemoryLayout<Double>.size), &value)
+    logger.notice(
+      "Requested input device rate \(rate) Hz (was \(self.inputDeviceRate) Hz): status \(status)"
+    )
   }
 
   func stop() {
@@ -361,7 +425,9 @@ final class AudioEngine: @unchecked Sendable {
     try check(AudioUnitInitialize(unit), "initialize input unit")
   }
 
-  private func configureOutputUnit(_ unit: AudioComponentInstance, deviceID: AudioDeviceID) throws {
+  private func configureOutputUnit(
+    _ unit: AudioComponentInstance, deviceID: AudioDeviceID, sampleRate: Double
+  ) throws {
     var enableOutput: UInt32 = 1
     var disableInput: UInt32 = 0
     try check(
@@ -400,7 +466,7 @@ final class AudioEngine: @unchecked Sendable {
       "set output device"
     )
 
-    var asbd = streamFormat(channels: 2)
+    var asbd = streamFormat(channels: 2, sampleRate: sampleRate)
     try check(
       AudioUnitSetProperty(
         unit,
@@ -594,7 +660,7 @@ final class AudioEngine: @unchecked Sendable {
     inputData = [Float](
       repeating: 0, count: Int(maximumInputFrames) * InputChannelLayout.channelCount)
     inputRateConverter = InputRateConverter(
-      deviceRate: inputDeviceRate, channelCount: inputChannels)
+      deviceRate: inputDeviceRate, channelCount: inputChannels, outputRate: pipelineRate)
     inputRateConverter?.prime()
   }
 
@@ -619,16 +685,84 @@ final class AudioEngine: @unchecked Sendable {
     }
   }
 
-  /// 48 kHz frames produced for one device-rate callback.
+  /// Pipeline-rate frames produced for one device-rate callback.
   private func converterFrames(forDeviceFrames frames: Int) -> Int {
     inputRateConverter?.convertedFrames(forInputFrames: frames) ?? frames
   }
 
-  /// Reopens only the input unit when a player or sample-rate switcher changes the
-  /// input device's rate or width. The output unit and its queue keep running, so a
-  /// rate switch no longer stops the renderer.
-  private func reconfigureInputIfNeeded() throws {
-    guard !keepAliveOnly, let unit = inputUnit else { return }
+  /// Passthrough rate: the input device's rate when the output device can accept it,
+  /// otherwise a 48/44.1 kHz fallback (the only case that still converts).
+  private func resolvePipelineRate(inputRate: Double, outputDeviceID: AudioDeviceID) -> Double {
+    if DeviceManager.isSampleRateAvailable(inputRate, id: outputDeviceID) { return inputRate }
+    return Self.fallbackPipelineRate(deviceID: outputDeviceID)
+  }
+
+  private static func fallbackPipelineRate(deviceID: AudioDeviceID) -> Double {
+    for candidate in [48_000.0, 44_100.0]
+    where DeviceManager.isSampleRateAvailable(candidate, id: deviceID) {
+      return candidate
+    }
+    let current = DeviceManager.sampleRate(id: deviceID)
+    return DownmixProcessor.supportedSampleRates.contains(current) ? current : targetSampleRate
+  }
+
+  /// Asks the output device for `requested` and returns the rate the pipeline should use.
+  /// A device that cannot take it falls back so the local path never converts silently.
+  @discardableResult
+  private func applyOutputSampleRate(_ requested: Double) -> Double {
+    let deviceID = expectedOutputDeviceID
+    guard deviceID != kAudioObjectUnknown else { return requested }
+    guard DeviceManager.isSampleRateAvailable(requested, id: deviceID) else {
+      let fallback = Self.fallbackPipelineRate(deviceID: deviceID)
+      if lastOutputRateNotice != fallback {
+        lastOutputRateNotice = fallback
+        logger.notice(
+          "Output device does not offer \(requested) Hz; rendering at \(fallback) Hz")
+      }
+      return fallback
+    }
+    var address = AudioObjectPropertyAddress(
+      mSelector: kAudioDevicePropertyNominalSampleRate,
+      mScope: kAudioObjectPropertyScopeGlobal,
+      mElement: kAudioObjectPropertyElementMain
+    )
+    var settable: DarwinBoolean = false
+    guard AudioObjectIsPropertySettable(deviceID, &address, &settable) == noErr,
+      settable.boolValue
+    else {
+      let fallback = Self.fallbackPipelineRate(deviceID: deviceID)
+      if lastOutputRateNotice != fallback {
+        lastOutputRateNotice = fallback
+        logger.warning("Output device rate is not settable; rendering at \(fallback) Hz")
+      }
+      return fallback
+    }
+    var value = requested
+    let status = AudioObjectSetPropertyData(
+      deviceID, &address, 0, nil, UInt32(MemoryLayout<Double>.size), &value)
+    guard status == noErr else {
+      let fallback = Self.fallbackPipelineRate(deviceID: deviceID)
+      if lastOutputRateNotice != fallback {
+        lastOutputRateNotice = fallback
+        logger.warning(
+          "Output device refused \(requested) Hz (\(status)); rendering at \(fallback) Hz")
+      }
+      return fallback
+    }
+    lastOutputRateNotice = requested
+    return requested
+  }
+
+  private static func meterFrames(forSampleRate rate: Double) -> Int {
+    max(4_800, Int((rate * 0.1).rounded()))
+  }
+
+  /// Reopens both units when the input format or the passthrough rate changes. The
+  /// stereo mix must switch rate with the source, and the output client format must
+  /// match the output device, so this is a full (brief) transport restart rather than
+  /// an input-only reopen.
+  private func reconfigurePipelineIfNeeded() throws {
+    guard !keepAliveOnly, let input = inputUnit, let output = outputUnit else { return }
     guard let live = DeviceManager.inputFormat(id: expectedInputDeviceID) else {
       throw EngineError.setupFailed("The selected input device is unavailable")
     }
@@ -643,35 +777,97 @@ final class AudioEngine: @unchecked Sendable {
         "The selected input changed to \(Self.rateLabel(live.rate)), which Downmix does not support."
       )
     }
-    guard channels != inputChannels || live.rate != inputDeviceRate else { return }
+    let desiredRate = resolvePipelineRate(
+      inputRate: live.rate, outputDeviceID: expectedOutputDeviceID)
+    let inputChanged = channels != inputChannels || live.rate != inputDeviceRate
+    let pipelineChanged = abs(desiredRate - pipelineRate) > 0.5
+    let liveOutputRate = DeviceManager.sampleRate(id: expectedOutputDeviceID)
+    let outputDeviation = abs(liveOutputRate - pipelineRate) > 0.5
+    guard inputChanged || pipelineChanged || outputDeviation else { return }
 
+    // Even if restoring the nominal rate succeeds, replace the units: an AUHAL can
+    // retain its old device-side clock/converter while reporting the new client rate.
+    try reopenPipeline(inputRate: live.rate, channels: channels, output: output, input: input)
+  }
+
+  private func reopenPipeline(
+    inputRate: Double, channels: Int, output: AudioComponentInstance,
+    input: AudioComponentInstance
+  ) throws {
     logger.notice(
-      "Input format changed to \(live.rate) Hz / \(channels) ch; reopening the input unit")
-    _ = AudioOutputUnitStop(unit)
-    _ = AudioUnitUninitialize(unit)
+      "Pipeline reopen: input \(inputRate) Hz / \(channels) ch, render \(self.pipelineRate) Hz")
+    // Uninitialize + a new client ASBD is insufficient on real AUHAL: rate changes
+    // can leave a reused unit with stale device-side conversion/timing and sustained
+    // queue starvation despite matching rate properties. Dispose BOTH units before
+    // replacing callback storage or changing the output rate, then attach fresh units
+    // to the live devices.
+    _ = AudioOutputUnitStop(input)
+    _ = AudioUnitUninitialize(input)
+    try check(AudioComponentInstanceDispose(input), "dispose input unit for rate change")
+    inputUnit = nil
+    _ = AudioOutputUnitStop(output)
+    _ = AudioUnitUninitialize(output)
+    try check(AudioComponentInstanceDispose(output), "dispose output unit for rate change")
+    outputUnit = nil
+    // Only the old generation can have rendered so far. Never clear a failure after
+    // starting fresh callbacks: that could hide a genuine error in the new format.
+    audioDiagnostics.clearStaleFormatFailure(kAudioUnitErr_CannotDoInCurrentContext)
 
     inputChannels = channels
-    inputDeviceRate = live.rate
+    inputDeviceRate = inputRate
+    pipelineRate = applyOutputSampleRate(
+      resolvePipelineRate(inputRate: inputRate, outputDeviceID: expectedOutputDeviceID))
     configuration.inputChannelCount = channels
+    configuration.sampleRate = pipelineRate
+    meterPublishFrames = Self.meterFrames(forSampleRate: pipelineRate)
+    negotiatedInputFrames = 0
+    negotiatedOutputFrames = 0
 
-    var asbd = streamFormat(channels: UInt32(channels), sampleRate: live.rate)
-    try check(
-      AudioUnitSetProperty(
-        unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 1, &asbd,
-        UInt32(MemoryLayout<AudioStreamBasicDescription>.size)),
-      "update input unit client format")
-    try setMaximumFramesPerSlice(unit, deviceID: expectedInputDeviceID)
-    maximumInputFrames = try maximumFramesPerSlice(unit)
+    let newInput = try makeHALUnit()
+    inputUnit = newInput
+    try configureInputUnit(newInput, deviceID: expectedInputDeviceID)
+    maximumInputFrames = try maximumFramesPerSlice(newInput)
+    guard UInt64(maximumInputFrames) * UInt64(inputChannels) * 4 <= UInt64(UInt32.max)
+    else {
+      throw EngineError.setupFailed("Input slice exceeds the audio buffer byte limit")
+    }
+    let newOutput = try makeHALUnit()
+    outputUnit = newOutput
+    try configureOutputUnit(
+      newOutput, deviceID: expectedOutputDeviceID, sampleRate: pipelineRate)
+    maximumOutputFrames = try maximumFramesPerSlice(newOutput)
+    guard Int(maximumInputFrames) >= negotiatedInputFrames,
+      Int(maximumOutputFrames) >= negotiatedOutputFrames
+    else {
+      throw EngineError.setupFailed(
+        "Audio unit maximum slice is smaller than the device I/O buffer")
+    }
     try allocateInputBuffers()
+    let buffering = StereoOutputBuffering(
+      inputFrames: converterFrames(forDeviceFrames: negotiatedInputFrames),
+      outputFrames: negotiatedOutputFrames,
+      maximumInputFrames: maximumConvertedFrames,
+      maximumOutputFrames: Int(maximumOutputFrames),
+      sampleRate: pipelineRate
+    )
+    ring = FloatRingBuffer(capacity: buffering.ringCapacityFrames * 2)
+    outputRenderer = StereoOutputRenderer(
+      ring: ring, diagnostics: audioDiagnostics, maximumFrames: maximumOutputFrames,
+      driftCorrection: true, targetFrames: buffering.targetFrames, sampleRate: pipelineRate
+    )
     // Consumed by the first callback after the restart, before it processes samples.
     configurationMailbox.publish(DownmixProcessor.RealtimeConfiguration(configuration))
-    try check(AudioUnitInitialize(unit), "reinitialize input unit")
-    try check(AudioOutputUnitStart(unit), "restart audio unit")
-    // Between the device's rate change and this reopen the old client format can fail
-    // renders with "cannot do in current context". That error is stale now; genuine
-    // render failures are still reported.
-    audioDiagnostics.clearStaleFormatFailure(kAudioUnitErr_CannotDoInCurrentContext)
-    logger.notice("Input unit reopened at \(live.rate) Hz / \(channels) ch")
+    // A Stop can close the gate while this tick reconfigures. Do not start units for a
+    // cancelled run; the queued Stop command disposes them.
+    guard renderGate?.isOpen == true else { return }
+    try verifyRoutes()
+    try startUnit(newOutput)
+    try startUnit(newInput)
+    publish(
+      phase: .running,
+      message: Self.runningMessage(inputRate: inputRate, renderRate: self.pipelineRate))
+    logger.notice(
+      "Pipeline reopened: input \(inputRate) Hz / \(channels) ch, render \(self.pipelineRate) Hz")
   }
 
   private static func rateLabel(_ rate: Double) -> String {
@@ -683,9 +879,13 @@ final class AudioEngine: @unchecked Sendable {
     return "\(text) kHz"
   }
 
-  private static func runningMessage(inputRate: Double) -> String {
-    guard inputRate != targetSampleRate else { return "Stereo renderer running" }
-    return "Stereo renderer running · \(rateLabel(inputRate)) → 48 kHz"
+  private static func runningMessage(inputRate: Double, renderRate: Double) -> String {
+    if inputRate == renderRate {
+      return renderRate == targetSampleRate
+        ? "Stereo renderer running" : "Stereo renderer running · \(rateLabel(renderRate))"
+    }
+    return
+      "Stereo renderer running · \(rateLabel(inputRate)) → \(rateLabel(renderRate)) (output limit)"
   }
 
   private func startUnit(_ unit: AudioComponentInstance) throws {
@@ -747,6 +947,9 @@ final class AudioEngine: @unchecked Sendable {
     inputRateConverter = nil
     inputChannels = InputChannelLayout.channelCount
     inputDeviceRate = Self.targetSampleRate
+    pipelineRate = Self.targetSampleRate
+    meterPublishFrames = 4_800
+    lastOutputRateNotice = nil
 
     if inUnit != nil || outUnit != nil {
       logger.info("Audio units stopped and disposed")
@@ -845,10 +1048,10 @@ final class AudioEngine: @unchecked Sendable {
       }
     }
 
-    // The live device rate and width are allowed to change; `reconfigureInputIfNeeded`
-    // reopens the input instead of treating a player's rate switch as a failure. The
+    // The live device rate and width are allowed to change; `reconfigurePipelineIfNeeded`
+    // reopens instead of treating a player's rate switch as a failure. The
     // client format must still be the one this run installed.
-    let expectedRate = isInput ? inputDeviceRate : Self.targetSampleRate
+    let expectedRate = isInput ? inputDeviceRate : pipelineRate
     let expectedChannels = isInput ? inputChannels : 2
     let bus: UInt32 = isInput ? 1 : 0
     for clientSide in [false, true] {
@@ -957,9 +1160,11 @@ final class AudioEngine: @unchecked Sendable {
     if phase == .running && !keepAliveOnly {
       status.inputSampleRate = inputDeviceRate
       status.inputChannelCount = inputChannels
+      status.renderSampleRate = pipelineRate
     } else {
       status.inputSampleRate = nil
       status.inputChannelCount = nil
+      status.renderSampleRate = nil
     }
     if phase == .running || phase == .keepAlive || phase == .error {
       status.diagnostics = diagnosticsSnapshot()
@@ -1051,8 +1256,8 @@ final class AudioEngine: @unchecked Sendable {
       }
     }
     framesSinceMeterPublish += processedFrames
-    if framesSinceMeterPublish >= 4800 {
-      framesSinceMeterPublish %= 4800
+    if framesSinceMeterPublish >= meterPublishFrames {
+      framesSinceMeterPublish %= meterPublishFrames
       let meters = processor.takeRealtimeMeterSnapshot()
       audioDiagnostics.recordClipping(left: meters.clipL, right: meters.clipR)
       meterMailbox.publish(meters)
@@ -1098,7 +1303,8 @@ final class AudioEngine: @unchecked Sendable {
 
   private func diagnosticsSnapshot() -> EngineDiagnostics {
     audioDiagnostics.snapshot(
-      requested: Int(framesPerBuffer), input: negotiatedInputFrames, output: negotiatedOutputFrames
+      requested: Int(framesPerBuffer), input: negotiatedInputFrames,
+      output: negotiatedOutputFrames, sampleRate: pipelineRate
     )
   }
 
@@ -1122,13 +1328,15 @@ final class AudioEngine: @unchecked Sendable {
     guard isRunning else { return }
     do {
       try self.verifyRoutes()
-      // A player or sample-rate switcher changed the input format: reopen the input
-      // unit instead of reporting a failure. The stereo output keeps running.
-      try self.reconfigureInputIfNeeded()
+      // A player or sample-rate switcher changed the format: replace both units so
+      // device-side timing/conversion is rebuilt as well as the client ASBD.
+      try self.reconfigurePipelineIfNeeded()
       if !self.keepAliveOnly {
         self.status.inputSampleRate = self.inputDeviceRate
         self.status.inputChannelCount = self.inputChannels
-        self.status.message = Self.runningMessage(inputRate: self.inputDeviceRate)
+        self.status.renderSampleRate = self.pipelineRate
+        self.status.message = Self.runningMessage(
+          inputRate: self.inputDeviceRate, renderRate: self.pipelineRate)
       }
     } catch {
       self.logger.error("Audio route lost: \(error.localizedDescription)")

@@ -18,6 +18,7 @@ final class StubHAL: @unchecked Sendable {
     var unreadable = false
     var physicalRate = 48_000.0
     var virtualRate = 48_000.0
+    var availableRates: [Double] = [44_100, 48_000, 88_200, 96_000, 176_400, 192_000]
   }
   struct Unit {
     var device: AudioDeviceID = 0
@@ -26,6 +27,9 @@ final class StubHAL: @unchecked Sendable {
     var callback = AURenderCallbackStruct()
     var isInput = false
     var started = false
+    // Adversarial driver model: a device-side rate cache survives uninitialize even
+    // though property queries report fresh rates. Only rebinding/recreation clears it.
+    var boundDeviceRate = 0.0
   }
   var devices: [AudioDeviceID: Device] = [:]
   var units: [AudioComponentInstance: Unit] = [:]
@@ -71,6 +75,28 @@ final class StubHAL: @unchecked Sendable {
     var timestamp = AudioTimeStamp()
     return unit.callback.inputProc!(
       unit.callback.inputProcRefCon!, &flags, &timestamp, 1, frames, nil)
+  }
+
+  /// Pump valid stereo output at an independently modelled device cadence. If a unit
+  /// retains its old device-side conversion ratio, matching ASBDs alone will not save it.
+  func clockedOutputCallback(deviceFrames: UInt32) -> [Float] {
+    let unit = units.values.first { !$0.isInput }!
+    let frames = UInt32(
+      (Double(deviceFrames) * unit.client.mSampleRate / unit.boundDeviceRate).rounded())
+    var samples = [Float](repeating: 0, count: Int(frames) * 2)
+    var flags: AudioUnitRenderActionFlags = []
+    var timestamp = AudioTimeStamp()
+    samples.withUnsafeMutableBytes { raw in
+      var list = AudioBufferList(
+        mNumberBuffers: 1,
+        mBuffers: AudioBuffer(
+          mNumberChannels: 2, mDataByteSize: UInt32(raw.count), mData: raw.baseAddress))
+      precondition(
+        unit.callback.inputProc!(
+          unit.callback.inputProcRefCon!, &flags, &timestamp, 0, frames, &list)
+          == noErr)
+    }
+    return samples
   }
 
   func outputCallback(nilData: Bool = true) -> OSStatus {
@@ -135,7 +161,9 @@ func AudioUnitSetProperty(
 ) -> OSStatus {
   switch property {
   case kAudioOutputUnitProperty_CurrentDevice:
-    stubHAL.units[unit]!.device = data.load(as: AudioDeviceID.self)
+    let deviceID = data.load(as: AudioDeviceID.self)
+    stubHAL.units[unit]!.device = deviceID
+    stubHAL.units[unit]!.boundDeviceRate = stubHAL.devices[deviceID]!.rate
   case kAudioUnitProperty_StreamFormat:
     stubHAL.units[unit]!.client = data.load(as: AudioStreamBasicDescription.self)
     stubHAL.units[unit]!.isInput = bus == 1
@@ -226,6 +254,8 @@ func AudioObjectIsPropertySettable(
   switch address.pointee.mSelector {
   case kAudioDevicePropertyBufferFrameSize:
     settable.pointee = false
+  case kAudioDevicePropertyNominalSampleRate:
+    settable.pointee = true
   case kAudioDevicePropertyPreferredChannelLayout:
     settable.pointee = DarwinBoolean(stubHAL.layoutSettable)
   default:
@@ -239,6 +269,16 @@ func AudioObjectSetPropertyData(
   _ id: AudioObjectID, _ address: UnsafePointer<AudioObjectPropertyAddress>,
   _ qualifierSize: UInt32, _ qualifier: UnsafeRawPointer?, _ size: UInt32, _ data: UnsafeRawPointer
 ) -> OSStatus {
+  if address.pointee.mSelector == kAudioDevicePropertyNominalSampleRate {
+    guard var device = stubHAL.devices[id] else { return kAudioHardwareBadObjectError }
+    let requested = data.load(as: Double.self)
+    guard device.availableRates.contains(requested) else {
+      return kAudioDeviceUnsupportedFormatError
+    }
+    device.rate = requested
+    stubHAL.devices[id] = device
+    return noErr
+  }
   guard address.pointee.mSelector == kAudioDevicePropertyPreferredChannelLayout else {
     preconditionFailure("Checks must not mutate other device properties")
   }
@@ -273,6 +313,9 @@ func AudioObjectGetPropertyDataSize(
     size.pointee = UInt32(MemoryLayout<AudioBufferList>.size)
   case kAudioAggregateDevicePropertyActiveSubDeviceList:
     size.pointee = UInt32((stubHAL.devices[id]?.children?.count ?? 0) * 4)
+  case kAudioDevicePropertyAvailableNominalSampleRates:
+    size.pointee = UInt32(
+      (stubHAL.devices[id]?.availableRates.count ?? 0) * MemoryLayout<AudioValueRange>.size)
   case kAudioDevicePropertyStreams: size.pointee = 4
   default: preconditionFailure("Unexpected size query \(address.pointee.mSelector)")
   }
@@ -332,6 +375,13 @@ func AudioObjectGetPropertyData(
         mBuffers: AudioBuffer(mNumberChannels: UInt32(channels), mDataByteSize: 0, mData: nil)),
       as: AudioBufferList.self)
   case kAudioDevicePropertyNominalSampleRate: data.storeBytes(of: device.rate, as: Double.self)
+  case kAudioDevicePropertyAvailableNominalSampleRates:
+    for (index, value) in device.availableRates.enumerated() {
+      let range = AudioValueRange(mMinimum: value, mMaximum: value)
+      data.storeBytes(
+        of: range, toByteOffset: index * MemoryLayout<AudioValueRange>.size,
+        as: AudioValueRange.self)
+    }
   case kAudioDevicePropertyDeviceIsAlive: data.storeBytes(of: device.alive, as: UInt32.self)
   case kAudioDevicePropertyBufferFrameSize: data.storeBytes(of: UInt32(128), as: UInt32.self)
   case kAudioDevicePropertyPreferredChannelLayout:

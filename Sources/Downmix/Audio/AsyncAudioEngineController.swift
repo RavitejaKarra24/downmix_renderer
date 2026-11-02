@@ -124,6 +124,16 @@ final class AsyncAudioEngineController: AudioFailureDiagnosticsControlling {
     }
   }
 
+  /// Runs on the worker queue with the rest of HAL control. Ignored when no run is open:
+  /// a stopped or keep-alive engine never changes the system input rate.
+  func setInputSampleRate(_ rate: Double) {
+    guard let gate = renderGate else { return }
+    queue.async { [owner] in
+      guard owner.runGate === gate, let worker = owner.existingWorker else { return }
+      worker.requestInputSampleRate(rate)
+    }
+  }
+
   func stop() {
     stop(preservingFailureDiagnostics: false)
   }

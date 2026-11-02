@@ -34,6 +34,8 @@ private final class UIEngine: AudioEngineControlling {
   func updateConfiguration(_ configuration: DownmixProcessor.Configuration) {
     configurations.append(configuration)
   }
+  var requestedRates: [Double] = []
+  func setInputSampleRate(_ rate: Double) { requestedRates.append(rate) }
   func stop() {
     stops += 1
     emit(EngineStatus())
