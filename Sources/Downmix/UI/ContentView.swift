@@ -8,11 +8,7 @@ struct ContentView: View {
     @Bindable var state = state
 
     ZStack {
-      DownmixTheme.backgroundGradient.ignoresSafeArea()
-      Rectangle()
-        .fill(.ultraThinMaterial)
-        .opacity(0.34)
-        .ignoresSafeArea()
+      DownmixBackdrop().ignoresSafeArea()
 
       VStack(spacing: 16) {
         header
@@ -37,12 +33,15 @@ struct ContentView: View {
       HStack(spacing: 12) {
         ZStack {
           RoundedRectangle(cornerRadius: 12, style: .continuous)
-            .fill(DownmixTheme.accentSoft)
+            .fill(DownmixTheme.brandGradient)
+            .frame(width: 42, height: 42)
+            .shadow(color: DownmixTheme.accent.opacity(0.35), radius: 10, y: 3)
+          RoundedRectangle(cornerRadius: 12, style: .continuous)
+            .strokeBorder(Color.white.opacity(0.25), lineWidth: 1)
             .frame(width: 42, height: 42)
           Image(systemName: "waveform.path")
             .font(.system(size: 21, weight: .semibold))
-            .symbolRenderingMode(.hierarchical)
-            .foregroundStyle(DownmixTheme.accent)
+            .foregroundStyle(DownmixTheme.onAccent)
             .symbolEffect(
               .variableColor.iterative,
               options: .repeating,
@@ -57,7 +56,7 @@ struct ContentView: View {
             .tracking(0.25)
             .foregroundStyle(DownmixTheme.textPrimary)
           Text("9.1.6 → stereo  ·  native Core Audio")
-            .font(DownmixTheme.TypeScale.body)
+            .font(DownmixTheme.TypeScale.caption.weight(.medium))
             .foregroundStyle(DownmixTheme.textSecondary)
         }
       }
@@ -288,6 +287,7 @@ struct ContentView: View {
       .accessibilityIdentifier("main.swapOutputs")
     }
     .padding(12)
+    .frame(maxWidth: .infinity, alignment: .leading)
     .downmixRecessedWell(cornerRadius: 12)
   }
 

@@ -142,12 +142,26 @@ struct RateSignalPathView: View {
   @Environment(AppState.self) private var state
 
   var body: some View {
-    VStack(alignment: .leading, spacing: 8) {
-      rateRow("Source", value: state.playbackSourceSummary, identifier: "rate.source")
-      rateRow("Reported", value: state.reportedSourceRateText, identifier: "rate.reported")
-      rateRow("Captured", value: state.capturedRateText, identifier: "rate.capture")
-      rateRow("DSP", value: state.renderRateText, identifier: "rate.render")
-      rateRow("DAC", value: state.dacRateText, identifier: "rate.dac")
+    let stages: [(title: String, value: String, identifier: String)] = [
+      ("Source", state.playbackSourceSummary, "rate.source"),
+      ("Reported", state.reportedSourceRateText, "rate.reported"),
+      ("Captured", state.capturedRateText, "rate.capture"),
+      ("DSP", state.renderRateText, "rate.render"),
+      ("DAC", state.dacRateText, "rate.dac"),
+    ]
+
+    VStack(alignment: .leading, spacing: 12) {
+      VStack(alignment: .leading, spacing: 0) {
+        ForEach(Array(stages.enumerated()), id: \.element.identifier) { index, stage in
+          rateRow(
+            stage.title,
+            value: stage.value,
+            identifier: stage.identifier,
+            isFirst: index == 0,
+            isLast: index == stages.count - 1
+          )
+        }
+      }
 
       Text(state.rateConversionSummary)
         .font(.caption)
@@ -159,22 +173,56 @@ struct RateSignalPathView: View {
         "Any app routed to the selected BlackHole works. Browsers and Spotify may not expose the original rate. 16ch is device capacity, not the file's channel count."
       )
       .font(.caption)
-      .foregroundStyle(.secondary)
+      .foregroundStyle(.tertiary)
       .fixedSize(horizontal: false, vertical: true)
     }
   }
 
-  private func rateRow(_ title: String, value: String, identifier: String) -> some View {
-    LabeledContent {
+  /// One stage of the pipeline: a node on a vertical rail, its name and value.
+  private func rateRow(
+    _ title: String,
+    value: String,
+    identifier: String,
+    isFirst: Bool,
+    isLast: Bool
+  ) -> some View {
+    HStack(alignment: .firstTextBaseline, spacing: 10) {
+      Text(title.uppercased())
+        .font(DownmixTheme.TypeScale.label)
+        .tracking(0.6)
+        .foregroundStyle(DownmixTheme.textSecondary)
+        .frame(width: 72, alignment: .leading)
       Text(value)
-        .monospacedDigit()
-        .multilineTextAlignment(.trailing)
+        .font(.system(size: 12, weight: .medium).monospacedDigit())
+        .foregroundStyle(DownmixTheme.textPrimary)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .fixedSize(horizontal: false, vertical: true)
-    } label: {
-      Text(title)
     }
-    .font(.callout)
+    .padding(.leading, 20)
+    .padding(.vertical, 6)
+    .background(alignment: .leading) {
+      VStack(spacing: 0) {
+        Rectangle()
+          .fill(isFirst ? Color.clear : DownmixTheme.accent.opacity(0.28))
+          .frame(width: 1.5, height: 7)
+        Circle()
+          .fill(isLast ? DownmixTheme.good : DownmixTheme.panelTop)
+          .overlay(
+            Circle().strokeBorder(
+              isLast ? DownmixTheme.good : DownmixTheme.accent.opacity(0.75), lineWidth: 1.5)
+          )
+          .shadow(color: isLast ? DownmixTheme.good.opacity(0.6) : .clear, radius: 4)
+          .frame(width: 8, height: 8)
+        Rectangle()
+          .fill(isLast ? Color.clear : DownmixTheme.accent.opacity(0.28))
+          .frame(width: 1.5)
+          .frame(maxHeight: .infinity)
+      }
+      .frame(width: 8)
+      .accessibilityHidden(true)
+    }
     .accessibilityElement(children: .combine)
+    .accessibilityLabel("\(title): \(value)")
     .accessibilityIdentifier(identifier)
   }
 }

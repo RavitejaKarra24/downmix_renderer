@@ -80,7 +80,8 @@ final class DownmixMeterNSView: NSView {
   #endif
 
   override var isFlipped: Bool { true }
-  override var isOpaque: Bool { true }
+  // Cards are drawn with rounded corners over the window backdrop.
+  override var isOpaque: Bool { false }
 
   init(
     source: MeterSource,
@@ -199,11 +200,9 @@ final class DownmixMeterNSView: NSView {
 
   override func draw(_ dirtyRect: NSRect) {
     super.draw(dirtyRect)
-    DownmixTheme.nsBackground.setFill()
-    bounds.fill()
 
-    let gap: CGFloat = 14
-    let meterHeight = min(152, max(124, bounds.height * 0.29))
+    let gap: CGFloat = 16
+    let meterHeight = min(150, max(132, bounds.height * 0.22))
     let bedRect = NSRect(
       x: 0,
       y: 0,
@@ -550,294 +549,515 @@ final class DownmixMeterNSView: NSView {
     return min(6, max(minimumDB, db))
   }
 
+  // MARK: - Surfaces
+
+  private static let cardRadius: CGFloat = 18
+  private static let cardPadding: CGFloat = 20
+
   private func drawCard(_ rect: NSRect) {
     guard rect.width > 1, rect.height > 1 else { return }
     let path = NSBezierPath(
       roundedRect: rect.insetBy(dx: 0.5, dy: 0.5),
-      xRadius: 16,
-      yRadius: 16
+      xRadius: Self.cardRadius,
+      yRadius: Self.cardRadius
     )
-    DownmixTheme.nsSurfaceWell.setFill()
-    path.fill()
+    if let gradient = NSGradient(
+      starting: DownmixTheme.nsPanelTop,
+      ending: DownmixTheme.nsPanelBottom
+    ) {
+      // Flipped view: 90° runs from the top edge to the bottom edge.
+      gradient.draw(in: path, angle: 90)
+    } else {
+      DownmixTheme.nsPanelBottom.setFill()
+      path.fill()
+    }
     DownmixTheme.nsCardStroke.setStroke()
     path.lineWidth = 1
     path.stroke()
+
+    // A faint top-edge highlight gives the card a lit, glassy rim.
+    NSGraphicsContext.saveGraphicsState()
+    path.addClip()
+    let rim = NSBezierPath()
+    rim.move(to: NSPoint(x: rect.minX + Self.cardRadius, y: rect.minY + 1))
+    rim.line(to: NSPoint(x: rect.maxX - Self.cardRadius, y: rect.minY + 1))
+    DownmixTheme.nsPanelHighlight.setStroke()
+    rim.lineWidth = 1
+    rim.stroke()
+    NSGraphicsContext.restoreGraphicsState()
   }
 
-  // MARK: - Speaker plan
+  // MARK: - Soundfield
 
   private func drawBed(in rect: NSRect) {
-    guard rect.width > 180, rect.height > 180 else { return }
+    guard rect.width > 200, rect.height > 200 else { return }
+    let pad = Self.cardPadding
 
     drawText(
-      "9.1.6 speaker activity",
-      at: NSPoint(x: rect.minX + 18, y: rect.minY + 14),
-      size: 13,
+      "Soundfield",
+      at: NSPoint(x: rect.minX + pad, y: rect.minY + 16),
+      size: 15,
       weight: .semibold,
-      color: DownmixTheme.nsTextPrimary
+      color: DownmixTheme.nsTextPrimary,
+      rounded: true
     )
     drawText(
-      "16 CHANNELS",
-      at: NSPoint(x: rect.maxX - 18, y: rect.minY + 16),
+      "9.1.6 BED  ·  TOP VIEW",
+      at: NSPoint(x: rect.minX + pad, y: rect.minY + 38),
       size: 9,
-      weight: .medium,
-      color: DownmixTheme.nsTextSecondary,
-      rightAligned: true
+      weight: .semibold,
+      color: DownmixTheme.nsTextSecondary.withAlphaComponent(0.8),
+      kern: 0.9
     )
+    drawLegend(trailing: rect.maxX - pad, centerY: rect.minY + 27)
 
-    let horizontalInset = min(22, max(14, rect.width * 0.055))
-    let heightShelfHeight = min(66, max(56, rect.height * 0.19))
-    let heightShelf = NSRect(
-      x: rect.minX + horizontalInset,
-      y: rect.minY + 44,
-      width: rect.width - horizontalInset * 2,
-      height: heightShelfHeight
+    let headerHeight: CGFloat = 58
+    let stage = NSRect(
+      x: rect.minX + pad,
+      y: rect.minY + headerHeight,
+      width: rect.width - pad * 2,
+      height: rect.height - headerHeight - pad + 4
     )
-    drawHeightShelf(in: heightShelf)
-
-    let planRect = NSRect(
-      x: heightShelf.minX,
-      y: heightShelf.maxY + 9,
-      width: heightShelf.width,
-      height: max(72, rect.maxY - heightShelf.maxY - 21)
-    )
-    drawGroundPlan(in: planRect)
+    // Leave a lane above and below the plate for the FRONT/REAR captions.
+    let radius = min(stage.width, stage.height - 36) / 2
+    guard radius > 80 else { return }
+    drawSoundfield(center: NSPoint(x: stage.midX, y: stage.midY), radius: radius)
   }
 
-  private func drawHeightShelf(in rect: NSRect) {
-    let shelf = NSBezierPath(roundedRect: rect, xRadius: 11, yRadius: 11)
-    DownmixTheme.nsSurfaceRaised.withAlphaComponent(0.72).setFill()
-    shelf.fill()
-    DownmixTheme.nsHeightChannel.withAlphaComponent(0.20).setStroke()
-    shelf.lineWidth = 1
-    shelf.stroke()
-
-    let labelWidth = min(56, rect.width * 0.15)
-    drawText(
-      "HEIGHT",
-      at: NSPoint(x: rect.minX + 10, y: rect.midY - 5),
-      size: 9,
-      weight: .semibold,
-      color: DownmixTheme.nsHeightChannel
-    )
-
-    let groups: [(String, BedChannel, BedChannel)] = [
-      ("FRONT", .ltf, .rtf),
-      ("MID", .ltm, .rtm),
-      ("REAR", .ltr, .rtr),
+  private func drawLegend(trailing: CGFloat, centerY: CGFloat) {
+    let items: [(String, NSColor)] = [
+      ("LFE", DownmixTheme.nsLFEChannel),
+      ("Height", DownmixTheme.nsHeightChannel),
+      ("Bed", DownmixTheme.nsBedChannel),
     ]
-    let channelsWidth = rect.width - labelWidth - 10
-    let groupWidth = channelsWidth / CGFloat(groups.count)
-    let markerY = rect.minY + rect.height * 0.53
-
-    for (index, group) in groups.enumerated() {
-      let groupCenter = rect.minX + labelWidth + groupWidth * (CGFloat(index) + 0.5)
-      let pairOffset = min(17, groupWidth * 0.19)
-      drawText(
-        group.0,
-        at: NSPoint(x: groupCenter, y: rect.minY + 7),
-        size: 8,
+    var x = trailing
+    for item in items {
+      let width = drawText(
+        item.0,
+        at: NSPoint(x: x, y: centerY),
+        size: 10,
         weight: .medium,
-        color: DownmixTheme.nsTextSecondary.withAlphaComponent(0.78),
-        centered: true
-      )
-      drawChannelMarker(
-        group.1,
-        at: NSPoint(x: groupCenter - pairOffset, y: markerY)
-      )
-      drawChannelMarker(
-        group.2,
-        at: NSPoint(x: groupCenter + pairOffset, y: markerY)
-      )
+        color: DownmixTheme.nsTextSecondary,
+        rightAligned: true,
+        verticallyCentered: true
+      ).width
+      x -= width + 6
+      let dot = NSBezierPath(ovalIn: NSRect(x: x - 7, y: centerY - 3.5, width: 7, height: 7))
+      item.1.setFill()
+      dot.fill()
+      x -= 7 + 14
     }
   }
 
-  private func drawGroundPlan(in rect: NSRect) {
-    let frontY = rect.minY + 12
-    let rearY = rect.maxY - 9
-    let centerX = rect.midX
-    let frontHalfWidth = rect.width * 0.46
-    let rearHalfWidth = rect.width * 0.31
+  private func drawSoundfield(center: NSPoint, radius: CGFloat) {
+    let outerRadius = radius * 0.97
+    let bedRadius = radius * 0.79
+    let heightRadius = radius * 0.47
+    let markerRadius = min(17, max(11, radius * 0.048))
+    let listenerRadius = max(17, radius * 0.085)
+    let energy = BedChannel.allCases.reduce(CGFloat(0)) {
+      max($0, normalizedMeterLevel(displayedLevel($1)))
+    }
 
-    let room = NSBezierPath()
-    room.move(to: NSPoint(x: centerX - frontHalfWidth, y: frontY))
-    room.line(to: NSPoint(x: centerX + frontHalfWidth, y: frontY))
-    room.line(to: NSPoint(x: centerX + rearHalfWidth, y: rearY))
-    room.line(to: NSPoint(x: centerX - rearHalfWidth, y: rearY))
-    room.close()
-    DownmixTheme.nsSurfaceRaised.withAlphaComponent(0.28).setFill()
-    room.fill()
-    DownmixTheme.nsCardStroke.withAlphaComponent(0.92).setStroke()
-    room.lineWidth = 1
-    room.stroke()
+    // Floor plate with an ambient glow that breathes with overall activity.
+    let plate = NSBezierPath(ovalIn: circleRect(center, outerRadius))
+    if let floor = NSGradient(colors: [
+      DownmixTheme.nsStageCenter,
+      DownmixTheme.nsStageEdge,
+    ]) {
+      floor.draw(in: plate, relativeCenterPosition: .zero)
+    }
+    if let ambient = NSGradient(colors: [
+      DownmixTheme.nsBedChannel.withAlphaComponent(0.03 + 0.09 * energy),
+      DownmixTheme.nsBedChannel.withAlphaComponent(0),
+    ]) {
+      ambient.draw(in: plate, relativeCenterPosition: .zero)
+    }
+    DownmixTheme.nsCardStroke.setStroke()
+    plate.lineWidth = 1
+    plate.stroke()
 
-    let centerGuide = NSBezierPath()
-    centerGuide.move(to: NSPoint(x: centerX, y: frontY + 5))
-    centerGuide.line(to: NSPoint(x: centerX, y: rearY - 5))
-    DownmixTheme.nsCardStroke.withAlphaComponent(0.58).setStroke()
-    centerGuide.lineWidth = 0.75
-    centerGuide.stroke()
+    drawStereoSector(center: center, radius: bedRadius, energy: energy)
+    drawGuides(
+      center: center,
+      outerRadius: outerRadius,
+      bedRadius: bedRadius,
+      heightRadius: heightRadius
+    )
 
+    // Beams converge on the listener first, so every puck sits above them.
+    let placements: [(BedChannel, NSPoint, CGFloat)] = BedChannel.allCases.map { channel in
+      if channel == .lfe {
+        return (channel, NSPoint(x: center.x, y: center.y - radius * 0.26), markerRadius * 0.92)
+      }
+      let ring = channel.isHeight ? heightRadius : bedRadius
+      let size = channel.isHeight ? markerRadius * 0.86 : markerRadius
+      return (channel, polar(center, ring, Self.azimuth(of: channel)), size)
+    }
+    for (channel, point, size) in placements {
+      drawBeam(
+        from: point,
+        to: center,
+        stopRadius: listenerRadius,
+        color: channelFamilyColor(channel),
+        level: normalizedMeterLevel(displayedLevel(channel)),
+        width: size * 1.3
+      )
+    }
+    for (channel, point, size) in placements {
+      drawSpeaker(channel, at: point, radius: size)
+    }
+
+    drawListener(at: center, radius: listenerRadius)
+  }
+
+  /// The ±30° wedge a stereo pair actually reproduces, shown as a soft fan.
+  private func drawStereoSector(center: NSPoint, radius: CGFloat, energy: CGFloat) {
+    let sector = NSBezierPath()
+    sector.move(to: center)
+    // Flipped view: −90° points to the front (top). Arcs drawn counter-clockwise
+    // in model space run clockwise on screen.
+    sector.appendArc(
+      withCenter: center,
+      radius: radius,
+      startAngle: -120,
+      endAngle: -60,
+      clockwise: false
+    )
+    sector.close()
+    if let fan = NSGradient(colors: [
+      DownmixTheme.nsAccent.withAlphaComponent(0.05 + 0.07 * energy),
+      DownmixTheme.nsAccent.withAlphaComponent(0),
+    ]) {
+      NSGraphicsContext.saveGraphicsState()
+      sector.addClip()
+      fan.draw(from: center, to: NSPoint(x: center.x, y: center.y - radius), options: [])
+      NSGraphicsContext.restoreGraphicsState()
+    }
+  }
+
+  private func drawGuides(
+    center: NSPoint,
+    outerRadius: CGFloat,
+    bedRadius: CGFloat,
+    heightRadius: CGFloat
+  ) {
+    let hairline = DownmixTheme.nsStageGuide
+
+    // Compass ticks every 15°, emphasised every 45°.
+    for step in 0..<24 {
+      let degrees = CGFloat(step) * 15
+      let major = step % 3 == 0
+      let inner = outerRadius - (major ? 9 : 5)
+      let tick = NSBezierPath()
+      tick.move(to: polar(center, inner, degrees))
+      tick.line(to: polar(center, outerRadius - 1.5, degrees))
+      faded(hairline, major ? 1.5 : 0.8).setStroke()
+      tick.lineWidth = major ? 1.2 : 0.8
+      tick.lineCapStyle = .round
+      tick.stroke()
+    }
+
+    // Crosshair axes, dashed and very quiet.
+    let axes = NSBezierPath()
+    axes.move(to: NSPoint(x: center.x, y: center.y - outerRadius + 14))
+    axes.line(to: NSPoint(x: center.x, y: center.y + outerRadius - 14))
+    axes.move(to: NSPoint(x: center.x - outerRadius + 14, y: center.y))
+    axes.line(to: NSPoint(x: center.x + outerRadius - 14, y: center.y))
+    axes.setLineDash([2, 5], count: 2, phase: 0)
+    faded(hairline, 0.75).setStroke()
+    axes.lineWidth = 0.8
+    axes.stroke()
+
+    // Distance rings: bed layer, height layer and the near field.
+    let bedRing = NSBezierPath(ovalIn: circleRect(center, bedRadius))
+    hairline.setStroke()
+    bedRing.lineWidth = 1
+    bedRing.stroke()
+
+    let heightRing = NSBezierPath(ovalIn: circleRect(center, heightRadius))
+    heightRing.setLineDash([3, 4], count: 2, phase: 0)
+    DownmixTheme.nsHeightChannel.withAlphaComponent(0.32).setStroke()
+    heightRing.lineWidth = 1
+    heightRing.stroke()
+
+    let nearRing = NSBezierPath(ovalIn: circleRect(center, heightRadius * 0.5))
+    faded(hairline, 0.7).setStroke()
+    nearRing.lineWidth = 0.8
+    nearRing.stroke()
+
+    // Orientation captions sit just outside the plate on the vertical axis.
+    let labelColor = DownmixTheme.nsTextSecondary.withAlphaComponent(0.55)
     drawText(
       "FRONT",
-      at: NSPoint(x: rect.minX + 6, y: frontY - 10),
+      at: NSPoint(x: center.x, y: center.y - outerRadius - 15),
       size: 8,
-      weight: .medium,
-      color: DownmixTheme.nsTextSecondary.withAlphaComponent(0.65)
+      weight: .bold,
+      color: labelColor,
+      centered: true,
+      kern: 1.6
     )
     drawText(
       "REAR",
-      at: NSPoint(x: rect.minX + 6, y: rearY - 12),
+      at: NSPoint(x: center.x, y: center.y + outerRadius + 5),
       size: 8,
-      weight: .medium,
-      color: DownmixTheme.nsTextSecondary.withAlphaComponent(0.65)
+      weight: .bold,
+      color: labelColor,
+      centered: true,
+      kern: 1.6
     )
-
-    for channel in BedChannel.allCases where !channel.isHeight {
-      guard
-        let point = groundPosition(
-          for: channel,
-          centerX: centerX,
-          frontY: frontY,
-          rearY: rearY,
-          width: rect.width
-        )
-      else { continue }
-      drawChannelMarker(channel, at: point)
-    }
-
-    let listener = NSPoint(
-      x: centerX,
-      y: frontY + (rearY - frontY) * 0.58
+    drawText(
+      "HEIGHT",
+      at: NSPoint(x: center.x, y: center.y + heightRadius + 5),
+      size: 7.5,
+      weight: .bold,
+      color: DownmixTheme.nsHeightChannel.withAlphaComponent(0.55),
+      centered: true,
+      kern: 1.4
     )
-    drawListener(at: listener)
   }
 
-  private func groundPosition(
-    for channel: BedChannel,
-    centerX: CGFloat,
-    frontY: CGFloat,
-    rearY: CGFloat,
+  private func drawBeam(
+    from point: NSPoint,
+    to center: NSPoint,
+    stopRadius: CGFloat,
+    color: NSColor,
+    level: CGFloat,
     width: CGFloat
-  ) -> NSPoint? {
-    let depth = rearY - frontY
-    switch channel {
-    case .lw:
-      return NSPoint(x: centerX - width * 0.40, y: frontY + depth * 0.11)
-    case .l:
-      return NSPoint(x: centerX - width * 0.21, y: frontY + depth * 0.06)
-    case .c:
-      return NSPoint(x: centerX, y: frontY + depth * 0.035)
-    case .r:
-      return NSPoint(x: centerX + width * 0.21, y: frontY + depth * 0.06)
-    case .rw:
-      return NSPoint(x: centerX + width * 0.40, y: frontY + depth * 0.11)
-    case .lfe:
-      return NSPoint(x: centerX + width * 0.12, y: frontY + depth * 0.25)
-    case .ls:
-      return NSPoint(x: centerX - width * 0.37, y: frontY + depth * 0.54)
-    case .rs:
-      return NSPoint(x: centerX + width * 0.37, y: frontY + depth * 0.54)
-    case .lrs:
-      return NSPoint(x: centerX - width * 0.23, y: frontY + depth * 0.88)
-    case .rrs:
-      return NSPoint(x: centerX + width * 0.23, y: frontY + depth * 0.88)
-    case .ltf, .rtf, .ltm, .rtm, .ltr, .rtr:
-      return nil
-    }
+  ) {
+    guard level > 0.02 else { return }
+    let dx = center.x - point.x
+    let dy = center.y - point.y
+    let length = hypot(dx, dy)
+    guard length > stopRadius + 4 else { return }
+    let ux = dx / length
+    let uy = dy / length
+    let end = NSPoint(x: center.x - ux * stopRadius, y: center.y - uy * stopRadius)
+    let half = width * (0.3 + 0.7 * level) / 2
+
+    let beam = NSBezierPath()
+    beam.move(to: NSPoint(x: point.x - uy * half, y: point.y + ux * half))
+    beam.line(to: NSPoint(x: end.x - uy * 1.2, y: end.y + ux * 1.2))
+    beam.line(to: NSPoint(x: end.x + uy * 1.2, y: end.y - ux * 1.2))
+    beam.line(to: NSPoint(x: point.x + uy * half, y: point.y - ux * half))
+    beam.close()
+
+    guard
+      let gradient = NSGradient(colors: [
+        color.withAlphaComponent(0.30 * level),
+        color.withAlphaComponent(0.02),
+      ])
+    else { return }
+    NSGraphicsContext.saveGraphicsState()
+    beam.addClip()
+    gradient.draw(from: point, to: end, options: [])
+    NSGraphicsContext.restoreGraphicsState()
   }
 
-  private func drawListener(at point: NSPoint) {
-    let surround = NSBezierPath(
-      ovalIn: NSRect(x: point.x - 20, y: point.y - 20, width: 40, height: 40)
-    )
-    DownmixTheme.nsSurfaceRaised.setFill()
-    surround.fill()
-    DownmixTheme.nsCardStroke.setStroke()
-    surround.lineWidth = 1
-    surround.stroke()
-
-    let head = NSBezierPath(
-      ovalIn: NSRect(x: point.x - 4, y: point.y - 8, width: 8, height: 8)
-    )
-    DownmixTheme.nsTextSecondary.setFill()
-    head.fill()
-
-    let shoulders = NSBezierPath()
-    shoulders.move(to: NSPoint(x: point.x - 8, y: point.y + 7))
-    shoulders.curve(
-      to: NSPoint(x: point.x + 8, y: point.y + 7),
-      controlPoint1: NSPoint(x: point.x - 6, y: point.y),
-      controlPoint2: NSPoint(x: point.x + 6, y: point.y)
-    )
-    DownmixTheme.nsTextSecondary.setStroke()
-    shoulders.lineWidth = 1.5
-    shoulders.stroke()
-  }
-
-  private func drawChannelMarker(_ channel: BedChannel, at point: NSPoint) {
+  private func drawSpeaker(_ channel: BedChannel, at point: NSPoint, radius: CGFloat) {
     let index = channel.rawValue
-    let db =
-      index < displayedSnapshot.inputPeaksDb.count
-      ? displayedSnapshot.inputPeaksDb[index]
-      : Self.minimumDB
-    let heldDB =
-      index < bedPeakHolds.count
-      ? bedPeakHolds[index].db
-      : Self.minimumDB
+    let db = displayedLevel(channel)
+    let heldDB = index < bedPeakHolds.count ? bedPeakHolds[index].db : Self.minimumDB
     let level = normalizedMeterLevel(db)
     let active = db > -48
-    let familyColor = channelFamilyColor(channel)
+    let color = channelFamilyColor(channel)
+    let ringWidth = max(2, radius * 0.15)
 
-    if active {
-      let glowSize = 22 + 7 * level
-      let glow = NSBezierPath(
-        ovalIn: NSRect(
-          x: point.x - glowSize / 2,
-          y: point.y - glowSize / 2,
-          width: glowSize,
-          height: glowSize
-        )
-      )
-      familyColor.withAlphaComponent(0.10 + 0.16 * level).setFill()
-      glow.fill()
-    }
-
-    let markerRect = NSRect(x: point.x - 7, y: point.y - 7, width: 14, height: 14)
-    let marker = NSBezierPath(ovalIn: markerRect)
+    // Soft bloom behind the puck.
     if level > 0 {
-      familyColor.withAlphaComponent(0.32 + 0.68 * level).setFill()
-    } else {
-      DownmixTheme.nsMeterTrack.setFill()
+      let bloom = NSBezierPath(ovalIn: circleRect(point, radius * (1.55 + 1.25 * level)))
+      if let gradient = NSGradient(colors: [
+        color.withAlphaComponent(0.42 * level),
+        color.withAlphaComponent(0),
+      ]) {
+        gradient.draw(in: bloom, relativeCenterPosition: .zero)
+      }
     }
-    marker.fill()
-    (active ? familyColor : DownmixTheme.nsCardStroke).setStroke()
-    marker.lineWidth = active ? 1.25 : 1
-    marker.stroke()
+
+    // Level ring: a quiet track and a bright arc that fills clockwise from the top.
+    let track = NSBezierPath(ovalIn: circleRect(point, radius))
+    DownmixTheme.nsMeterTrack.setStroke()
+    track.lineWidth = ringWidth
+    track.stroke()
+
+    if level > 0.004 {
+      let arc = NSBezierPath()
+      arc.appendArc(
+        withCenter: point,
+        radius: radius,
+        startAngle: -90,
+        endAngle: -90 + 360 * level,
+        clockwise: false
+      )
+      color.setStroke()
+      arc.lineWidth = ringWidth
+      arc.lineCapStyle = .round
+      arc.stroke()
+    }
 
     if heldDB > Self.meterFloorDB {
-      let heldLevel = normalizedMeterLevel(heldDB)
-      let peakWidth = 5 + 8 * heldLevel
-      let peakLine = NSBezierPath()
-      peakLine.move(to: NSPoint(x: point.x - peakWidth / 2, y: point.y - 11))
-      peakLine.line(to: NSPoint(x: point.x + peakWidth / 2, y: point.y - 11))
-      familyColor.withAlphaComponent(0.52 + 0.48 * heldLevel).setStroke()
-      peakLine.lineWidth = 1.5
-      peakLine.lineCapStyle = .round
-      peakLine.stroke()
+      let held = normalizedMeterLevel(heldDB)
+      let angle = (-90 + 360 * held) * .pi / 180
+      let tip = NSPoint(x: point.x + cos(angle) * radius, y: point.y + sin(angle) * radius)
+      let peak = NSBezierPath(ovalIn: circleRect(tip, ringWidth * 0.62))
+      DownmixTheme.nsTextPrimary.withAlphaComponent(0.55 + 0.4 * held).setFill()
+      peak.fill()
     }
+
+    // Driver body. The sub is a cabinet; everything else is a round driver.
+    let bodyRadius = radius - ringWidth / 2 - 2.5
+    let body =
+      channel == .lfe
+      ? NSBezierPath(
+        roundedRect: circleRect(point, bodyRadius * 0.92),
+        xRadius: bodyRadius * 0.38,
+        yRadius: bodyRadius * 0.38
+      )
+      : NSBezierPath(ovalIn: circleRect(point, bodyRadius))
+    DownmixTheme.nsSpeakerBody.setFill()
+    body.fill()
+    if level > 0 {
+      color.withAlphaComponent(0.12 + 0.5 * level).setFill()
+      body.fill()
+    }
+    (active ? color.withAlphaComponent(0.55) : DownmixTheme.nsCardStroke).setStroke()
+    body.lineWidth = 0.8
+    body.stroke()
+
+    let coneColor =
+      level > 0
+      ? NSColor.white.withAlphaComponent(0.35 + 0.55 * level)
+      : DownmixTheme.nsTextSecondary.withAlphaComponent(0.32)
+    let cone = NSBezierPath(ovalIn: circleRect(point, bodyRadius * 0.52))
+    coneColor.setStroke()
+    cone.lineWidth = 1
+    cone.stroke()
+    let cap = NSBezierPath(ovalIn: circleRect(point, max(1.4, bodyRadius * 0.17)))
+    coneColor.setFill()
+    cap.fill()
 
     drawText(
       channel.label,
-      at: NSPoint(x: point.x, y: point.y + 9),
-      size: 9,
+      at: NSPoint(x: point.x, y: point.y + radius + ringWidth / 2 + 3),
+      size: 10,
       weight: .semibold,
       color:
         active
         ? DownmixTheme.nsTextPrimary
-        : DownmixTheme.nsTextSecondary.withAlphaComponent(0.72),
-      centered: true
+        : DownmixTheme.nsTextSecondary.withAlphaComponent(0.7),
+      centered: true,
+      rounded: true
     )
+  }
+
+  /// A top-down listener: shoulders, head and a small nose pointing to the front.
+  private func drawListener(at point: NSPoint, radius: CGFloat) {
+    let halo = NSBezierPath(ovalIn: circleRect(point, radius * 1.6))
+    if let gradient = NSGradient(colors: [
+      DownmixTheme.nsPanelBottom.withAlphaComponent(0.85),
+      DownmixTheme.nsPanelBottom.withAlphaComponent(0),
+    ]) {
+      gradient.draw(in: halo, relativeCenterPosition: .zero)
+    }
+
+    let disc = NSBezierPath(ovalIn: circleRect(point, radius))
+    DownmixTheme.nsSpeakerBody.setFill()
+    disc.fill()
+    DownmixTheme.nsCardStroke.setStroke()
+    disc.lineWidth = 1
+    disc.stroke()
+
+    let figure = DownmixTheme.nsTextSecondary
+    let shoulders = NSBezierPath(
+      roundedRect: NSRect(
+        x: point.x - radius * 0.6,
+        y: point.y - radius * 0.02,
+        width: radius * 1.2,
+        height: radius * 0.4
+      ),
+      xRadius: radius * 0.2,
+      yRadius: radius * 0.2
+    )
+    faded(figure, 0.42).setFill()
+    shoulders.fill()
+
+    let headCenter = NSPoint(x: point.x, y: point.y - radius * 0.04)
+    let headRadius = radius * 0.27
+    for side in [-1.0, 1.0] as [CGFloat] {
+      let ear = NSBezierPath(
+        ovalIn: NSRect(
+          x: headCenter.x + side * headRadius - radius * 0.07,
+          y: headCenter.y - radius * 0.1,
+          width: radius * 0.14,
+          height: radius * 0.2
+        )
+      )
+      faded(figure, 0.8).setFill()
+      ear.fill()
+    }
+    DownmixTheme.nsSpeakerBody.setStroke()
+    let head = NSBezierPath(ovalIn: circleRect(headCenter, headRadius))
+    figure.setFill()
+    head.fill()
+    head.lineWidth = 1.5
+    head.stroke()
+
+    // Facing indicator: a small chevron pointing to the front.
+    let chevronY = point.y - radius * 0.58
+    let chevron = NSBezierPath()
+    chevron.move(to: NSPoint(x: point.x - radius * 0.13, y: chevronY + radius * 0.07))
+    chevron.line(to: NSPoint(x: point.x, y: chevronY - radius * 0.05))
+    chevron.line(to: NSPoint(x: point.x + radius * 0.13, y: chevronY + radius * 0.07))
+    DownmixTheme.nsAccent.setStroke()
+    chevron.lineWidth = 1.4
+    chevron.lineCapStyle = .round
+    chevron.lineJoinStyle = .round
+    chevron.stroke()
+  }
+
+  /// Scales a dynamic colour's own alpha. `withAlphaComponent` replaces it, which
+  /// would turn translucent hairlines opaque.
+  private func faded(_ color: NSColor, _ factor: CGFloat) -> NSColor {
+    let resolved = color.usingColorSpace(.deviceRGB) ?? color
+    return resolved.withAlphaComponent(min(1, resolved.alphaComponent * factor))
+  }
+
+  /// Nominal azimuth in degrees: 0 is straight ahead, positive is to the right.
+  private static func azimuth(of channel: BedChannel) -> CGFloat {
+    switch channel {
+    case .c, .lfe: 0
+    case .l: -30
+    case .r: 30
+    case .lw: -60
+    case .rw: 60
+    case .ls: -90
+    case .rs: 90
+    case .lrs: -135
+    case .rrs: 135
+    case .ltf: -45
+    case .rtf: 45
+    case .ltm: -90
+    case .rtm: 90
+    case .ltr: -135
+    case .rtr: 135
+    }
+  }
+
+  private func polar(_ center: NSPoint, _ radius: CGFloat, _ azimuthDegrees: CGFloat) -> NSPoint {
+    let radians = azimuthDegrees * .pi / 180
+    // Flipped view: the front (azimuth 0) is toward smaller y.
+    return NSPoint(x: center.x + sin(radians) * radius, y: center.y - cos(radians) * radius)
+  }
+
+  private func circleRect(_ center: NSPoint, _ radius: CGFloat) -> NSRect {
+    NSRect(x: center.x - radius, y: center.y - radius, width: radius * 2, height: radius * 2)
+  }
+
+  private func displayedLevel(_ channel: BedChannel) -> Float {
+    let index = channel.rawValue
+    return index < displayedSnapshot.inputPeaksDb.count
+      ? displayedSnapshot.inputPeaksDb[index]
+      : Self.minimumDB
   }
 
   private func channelFamilyColor(_ channel: BedChannel) -> NSColor {
@@ -853,37 +1073,42 @@ final class DownmixMeterNSView: NSView {
   // MARK: - Stereo meter
 
   private func drawStereoMeters(in rect: NSRect) {
-    guard rect.width > 180, rect.height > 100 else { return }
+    guard rect.width > 200, rect.height > 100 else { return }
+    let pad = Self.cardPadding
 
     drawText(
       "Stereo output",
-      at: NSPoint(x: rect.minX + 18, y: rect.minY + 13),
-      size: 13,
+      at: NSPoint(x: rect.minX + pad, y: rect.minY + 16),
+      size: 15,
       weight: .semibold,
-      color: DownmixTheme.nsTextPrimary
+      color: DownmixTheme.nsTextPrimary,
+      rounded: true
     )
     drawText(
-      "dBFS · PEAK",
-      at: NSPoint(x: rect.maxX - 18, y: rect.minY + 15),
+      "PEAK  ·  dBFS",
+      at: NSPoint(x: rect.maxX - pad, y: rect.minY + 27),
       size: 9,
-      weight: .medium,
-      color: DownmixTheme.nsTextSecondary,
-      rightAligned: true
+      weight: .semibold,
+      color: DownmixTheme.nsTextSecondary.withAlphaComponent(0.8),
+      rightAligned: true,
+      verticallyCentered: true,
+      kern: 0.9
     )
 
-    let valueWidth: CGFloat = 66
+    let labelWidth: CGFloat = 22
+    let valueWidth: CGFloat = 62
+    let barHeight: CGFloat = 12
+    let barGap: CGFloat = 12
+    let blockHeight = barHeight * 2 + barGap + 24
+    let top = rect.minY + 50 + max(0, (rect.height - 50 - 12 - blockHeight) / 2)
     let barRect = NSRect(
-      x: rect.minX + 43,
-      y: rect.minY + 64,
-      width: max(80, rect.width - 43 - valueWidth - 17),
-      height: 10
+      x: rect.minX + pad + labelWidth,
+      y: top,
+      width: max(80, rect.width - pad * 2 - labelWidth - valueWidth),
+      height: barHeight
     )
-    let secondBarRect = barRect.offsetBy(dx: 0, dy: 35)
-    drawMeterGrid(
-      barRect: barRect,
-      firstBarY: barRect.minY,
-      lastBarY: secondBarRect.maxY
-    )
+    let secondBarRect = barRect.offsetBy(dx: 0, dy: barHeight + barGap)
+    let valueX = rect.maxX - pad
 
     drawMeter(
       label: "L",
@@ -891,7 +1116,7 @@ final class DownmixMeterNSView: NSView {
       heldDB: leftPeakHold.db,
       clip: displayedSnapshot.clipL,
       barRect: barRect,
-      valueX: rect.maxX - 17
+      valueX: valueX
     )
     drawMeter(
       label: "R",
@@ -899,37 +1124,32 @@ final class DownmixMeterNSView: NSView {
       heldDB: rightPeakHold.db,
       clip: displayedSnapshot.clipR,
       barRect: secondBarRect,
-      valueX: rect.maxX - 17
+      valueX: valueX
     )
+    drawMeterScale(barRect: barRect, y: secondBarRect.maxY + 8)
   }
 
-  private func drawMeterGrid(barRect: NSRect, firstBarY: CGFloat, lastBarY: CGFloat) {
-    let ticks: [(String, Float)] = [
-      ("-60", -60),
-      ("-40", -40),
-      ("-20", -20),
-      ("-6", -6),
-      ("0", 0),
-    ]
-
+  private func drawMeterScale(barRect: NSRect, y: CGFloat) {
+    let ticks: [Float] = [-60, -48, -36, -24, -12, -6, 0]
     for tick in ticks {
-      let x = barRect.minX + barRect.width * normalizedMeterLevel(tick.1)
-      let gridLine = NSBezierPath()
-      gridLine.move(to: NSPoint(x: x, y: firstBarY - 15))
-      gridLine.line(to: NSPoint(x: x, y: lastBarY + 2))
-      DownmixTheme.nsCardStroke.withAlphaComponent(tick.1 == -6 ? 0.95 : 0.62).setStroke()
-      gridLine.lineWidth = tick.1 == -6 ? 0.9 : 0.6
-      gridLine.stroke()
+      let x = barRect.minX + barRect.width * normalizedMeterLevel(tick)
+      let mark = NSBezierPath()
+      mark.move(to: NSPoint(x: x, y: y))
+      mark.line(to: NSPoint(x: x, y: y + 3))
+      DownmixTheme.nsStageGuide.setStroke()
+      mark.lineWidth = 1
+      mark.stroke()
 
+      let hot = tick >= -6
       drawText(
-        tick.0,
-        at: NSPoint(x: x, y: firstBarY - 27),
-        size: 8,
+        tick == 0 ? "0" : String(format: "%.0f", tick).replacingOccurrences(of: "-", with: "−"),
+        at: NSPoint(x: x, y: y + 5),
+        size: 9,
         weight: .medium,
         color:
-          tick.1 == -6
-          ? DownmixTheme.nsWarn.withAlphaComponent(0.9)
-          : DownmixTheme.nsTextSecondary.withAlphaComponent(0.82),
+          hot
+          ? DownmixTheme.nsWarn.withAlphaComponent(0.85)
+          : DownmixTheme.nsTextSecondary.withAlphaComponent(0.7),
         centered: true,
         monospacedDigits: true
       )
@@ -946,11 +1166,13 @@ final class DownmixMeterNSView: NSView {
   ) {
     drawText(
       label,
-      at: NSPoint(x: barRect.minX - 19, y: barRect.minY - 3),
+      at: NSPoint(x: barRect.minX - 14, y: barRect.midY),
       size: 11,
-      weight: .semibold,
+      weight: .bold,
       color: DownmixTheme.nsTextSecondary,
-      centered: true
+      centered: true,
+      verticallyCentered: true,
+      rounded: true
     )
 
     let valueText =
@@ -958,24 +1180,26 @@ final class DownmixMeterNSView: NSView {
       ? "CLIP"
       : db <= -119
         ? "−∞"
-        : String(format: "%.1f", db)
+        : String(format: "%.1f", db).replacingOccurrences(of: "-", with: "−")
     let valueColor =
       clip
       ? DownmixTheme.nsBad
       : db >= -6
         ? DownmixTheme.nsWarn
-        : DownmixTheme.nsTextSecondary
+        : db <= -119 ? DownmixTheme.nsTextSecondary : DownmixTheme.nsTextPrimary
     drawText(
       valueText,
-      at: NSPoint(x: valueX, y: barRect.minY - 3),
-      size: 10,
-      weight: clip ? .semibold : .regular,
+      at: NSPoint(x: valueX, y: barRect.midY),
+      size: 12,
+      weight: .semibold,
       color: valueColor,
       rightAligned: true,
+      verticallyCentered: true,
       monospacedDigits: true
     )
 
-    let track = NSBezierPath(roundedRect: barRect, xRadius: 5, yRadius: 5)
+    let radius = barRect.height / 2
+    let track = NSBezierPath(roundedRect: barRect, xRadius: radius, yRadius: radius)
     DownmixTheme.nsMeterTrack.setFill()
     track.fill()
 
@@ -984,36 +1208,67 @@ final class DownmixMeterNSView: NSView {
       let fillRect = NSRect(
         x: barRect.minX,
         y: barRect.minY,
-        width: barRect.width * level,
+        width: max(barRect.height, barRect.width * level),
         height: barRect.height
       )
-      let fill = NSBezierPath(
-        roundedRect: fillRect,
-        xRadius: min(5, fillRect.width / 2),
-        yRadius: min(5, fillRect.height / 2)
-      )
-      let tipColor = meterTipColor(db: db, clip: clip)
+      let fill = NSBezierPath(roundedRect: fillRect, xRadius: radius, yRadius: radius)
+
+      NSGraphicsContext.saveGraphicsState()
+      let glow = NSShadow()
+      glow.shadowColor = meterTipColor(db: db, clip: clip).withAlphaComponent(0.45)
+      glow.shadowBlurRadius = 9
+      glow.shadowOffset = .zero
+      glow.set()
+      meterTipColor(db: db, clip: clip).withAlphaComponent(0.6).setFill()
+      fill.fill()
+      NSGraphicsContext.restoreGraphicsState()
+
+      // The gradient spans the whole scale so colour encodes level, not length.
+      NSGraphicsContext.saveGraphicsState()
+      fill.addClip()
       if let gradient = NSGradient(
-        starting: DownmixTheme.nsAccent,
-        ending: tipColor
+        colors: [
+          DownmixTheme.nsBedChannel,
+          DownmixTheme.nsAccent,
+          DownmixTheme.nsGood,
+          DownmixTheme.nsWarn,
+          DownmixTheme.nsBad,
+        ],
+        atLocations: [0, 0.45, 0.74, 0.9, 1],
+        colorSpace: .deviceRGB
       ) {
-        gradient.draw(in: fill, angle: 0)
-      } else {
-        tipColor.setFill()
-        fill.fill()
+        gradient.draw(
+          from: NSPoint(x: barRect.minX, y: barRect.midY),
+          to: NSPoint(x: barRect.maxX, y: barRect.midY),
+          options: []
+        )
       }
+      // LED-style segmentation.
+      DownmixTheme.nsPanelBottom.withAlphaComponent(0.55).setFill()
+      var x = barRect.minX + 4
+      while x < fillRect.maxX {
+        NSRect(x: x, y: barRect.minY, width: 1, height: barRect.height).fill(
+          using: .sourceOver)
+        x += 5
+      }
+      NSGraphicsContext.restoreGraphicsState()
     }
 
     if heldDB > Self.meterFloorDB {
-      let peakLevel = normalizedMeterLevel(heldDB)
-      let peakX = barRect.minX + barRect.width * peakLevel
-      let peakLine = NSBezierPath()
-      peakLine.move(to: NSPoint(x: peakX, y: barRect.minY - 2))
-      peakLine.line(to: NSPoint(x: peakX, y: barRect.maxY + 2))
-      meterTipColor(db: heldDB, clip: heldDB >= 0).setStroke()
-      peakLine.lineWidth = 1.6
-      peakLine.lineCapStyle = .round
-      peakLine.stroke()
+      let peakX = barRect.minX + barRect.width * normalizedMeterLevel(heldDB)
+      let peak = NSBezierPath(
+        roundedRect: NSRect(
+          x: min(barRect.maxX - 3, max(barRect.minX, peakX - 1.5)),
+          y: barRect.minY - 2,
+          width: 3,
+          height: barRect.height + 4
+        ),
+        xRadius: 1.5,
+        yRadius: 1.5
+      )
+      (heldDB >= -6 ? meterTipColor(db: heldDB, clip: heldDB >= 0) : DownmixTheme.nsTextPrimary)
+        .withAlphaComponent(0.9).setFill()
+      peak.fill()
     }
   }
 
@@ -1024,7 +1279,10 @@ final class DownmixMeterNSView: NSView {
     if db >= -6 {
       return DownmixTheme.nsWarn
     }
-    return DownmixTheme.nsGood
+    if db >= -18 {
+      return DownmixTheme.nsGood
+    }
+    return DownmixTheme.nsAccent
   }
 
   private func normalizedMeterLevel(_ db: Float) -> CGFloat {
@@ -1056,6 +1314,8 @@ final class DownmixMeterNSView: NSView {
 
   // MARK: - Text
 
+  /// Draws a single line. `point.y` is the top edge unless `verticallyCentered`.
+  @discardableResult
   private func drawText(
     _ text: String,
     at point: NSPoint,
@@ -1064,21 +1324,33 @@ final class DownmixMeterNSView: NSView {
     color: NSColor,
     centered: Bool = false,
     rightAligned: Bool = false,
-    monospacedDigits: Bool = false
-  ) {
-    let font =
+    verticallyCentered: Bool = false,
+    monospacedDigits: Bool = false,
+    rounded: Bool = false,
+    kern: CGFloat = 0
+  ) -> NSSize {
+    var font =
       monospacedDigits
       ? NSFont.monospacedDigitSystemFont(ofSize: size, weight: weight)
       : NSFont.systemFont(ofSize: size, weight: weight)
-    let attributes: [NSAttributedString.Key: Any] = [
+    if rounded, let descriptor = font.fontDescriptor.withDesign(.rounded),
+      let roundedFont = NSFont(descriptor: descriptor, size: size)
+    {
+      font = roundedFont
+    }
+    var attributes: [NSAttributedString.Key: Any] = [
       .font: font,
       .foregroundColor: color,
     ]
+    if kern != 0 { attributes[.kern] = kern }
     let string = text as NSString
     let textSize = string.size(withAttributes: attributes)
     var x = point.x
+    var y = point.y
     if centered { x -= textSize.width / 2 }
     if rightAligned { x -= textSize.width }
-    string.draw(at: NSPoint(x: x, y: point.y), withAttributes: attributes)
+    if verticallyCentered { y -= textSize.height / 2 }
+    string.draw(at: NSPoint(x: x, y: y), withAttributes: attributes)
+    return textSize
   }
 }
