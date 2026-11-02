@@ -127,10 +127,28 @@ final class AsyncAudioEngineController: AudioFailureDiagnosticsControlling {
   /// Runs on the worker queue with the rest of HAL control. Ignored when no run is open:
   /// a stopped or keep-alive engine never changes the system input rate.
   func setInputSampleRate(_ rate: Double) {
-    guard let gate = renderGate else { return }
+    enqueueInputRate(rate, requestGate: nil)
+  }
+
+  func setInputSampleRate(_ rate: Double, requestGate: AudioRateRequest) {
+    enqueueInputRate(rate, requestGate: requestGate)
+  }
+
+  private func enqueueInputRate(_ rate: Double, requestGate: AudioRateRequest?) {
+    guard let gate = renderGate, gate.isOpen else { return }
     queue.async { [owner] in
-      guard owner.runGate === gate, let worker = owner.existingWorker else { return }
-      worker.requestInputSampleRate(rate)
+      guard owner.runGate === gate, gate.isOpen, requestGate?.isOpen != false,
+        let worker = owner.existingWorker
+      else { return }
+      worker.requestInputSampleRate(rate, requestGate: requestGate)
+    }
+  }
+
+  func setOutputBitDepth(_ bits: Int?) {
+    guard let gate = renderGate, gate.isOpen else { return }
+    queue.async { [owner] in
+      guard owner.runGate === gate, gate.isOpen, let worker = owner.existingWorker else { return }
+      worker.requestOutputBitDepth(bits)
     }
   }
 

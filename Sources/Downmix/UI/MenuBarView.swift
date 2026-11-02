@@ -383,27 +383,11 @@ private struct AudioSettingsPane: View {
       }
 
       Section("Sample rate") {
-        Toggle(isOn: $state.preferences.matchMusicSampleRate) {
-          VStack(alignment: .leading, spacing: 2) {
-            Text("Match Apple Music's track rate")
-            Text(
-              "Sets the selected input and output devices to the current Music track's rate, so 96 kHz files are downmixed and sent to the DAC at 96 kHz. macOS asks for Automation permission the first time. The stereo mix runs at the input rate; 48 kHz is used only if the output device refuses that rate."
-            )
-            .font(.caption)
-            .foregroundStyle(.secondary)
-          }
-        }
-        .toggleStyle(.switch)
-        .accessibilityLabel("Match Apple Music's track rate")
-        .accessibilityIdentifier("settings.matchMusicRate")
-        .onChange(of: state.preferences.matchMusicSampleRate) { _, _ in
-          state.persist()
-        }
+        SampleRateControls()
+      }
 
-        Text(musicRateStatusText)
-          .font(.caption)
-          .foregroundStyle(.secondary)
-          .accessibilityIdentifier("settings.musicRateStatus")
+      Section("Signal path") {
+        RateSignalPathView()
       }
 
       Section("Downmix") {
@@ -461,22 +445,6 @@ private struct AudioSettingsPane: View {
           }
       }
     }
-  }
-
-  private var musicRateStatusText: String {
-    guard state.preferences.matchMusicSampleRate else {
-      return "Off: the input keeps the rate you set in Audio MIDI Setup."
-    }
-    if state.musicRateFailure == .automationDenied {
-      return "Allow Downmix to control Music in System Settings → Privacy & Security → Automation."
-    }
-    guard let rate = state.detectedMusicRate else {
-      return "Play something in Music to detect its rate."
-    }
-    let inputRate =
-      state.inputDevices.first { $0.id == state.selectedInputID }?.nominalSampleRate
-    let inputText = inputRate.map { "\(Int($0.rounded())) Hz" } ?? "no input"
-    return "Music \(Int(rate.rounded())) Hz · input \(inputText)"
   }
 
   private var inputSelection: Binding<AudioDeviceID?> {

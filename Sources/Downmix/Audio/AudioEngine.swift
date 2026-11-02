@@ -27,6 +27,9 @@ struct EngineStatus: Sendable, Equatable {
   /// Rate the DSP and stereo output client run at. Equals `inputSampleRate` for
   /// passthrough, or the fallback when the output device refuses the input rate.
   var renderSampleRate: Double?
+  /// Physical (DAC-side) format of the selected output for this run, after Downmix
+  /// asked for the deepest one at the render rate. `nil` while stopped or unreadable.
+  var outputPhysicalFormat: DeviceManager.PhysicalFormat?
 }
 
 /// Dual-device Core Audio engine: multi-channel input → DSP → stereo output.
@@ -74,6 +77,9 @@ final class AudioEngine: @unchecked Sendable {
   private var pipelineRate = AudioEngine.targetSampleRate
   private var meterPublishFrames = 4_800
   private var lastOutputRateNotice: Double?
+  private var outputPhysicalFormat: DeviceManager.PhysicalFormat?
+  /// Source bit depth to match at the DAC, when known; `nil` selects the deepest.
+  private var preferredOutputBits: Int?
   private var inputRateConverter: InputRateConverter?
   private var convertedInput = [Float]()
   private var maximumConvertedFrames = 0
@@ -276,8 +282,13 @@ final class AudioEngine: @unchecked Sendable {
   /// Best-effort rate match for the running input device. The watchdog notices the new
   /// nominal rate and recreates both units, with the selected output following it.
   func requestInputSampleRate(_ rate: Double) {
+    requestInputSampleRate(rate, requestGate: nil)
+  }
+
+  func requestInputSampleRate(_ rate: Double, requestGate: AudioRateRequest?) {
     dispatchPrecondition(condition: .onQueue(queue))
-    guard isRunning, !keepAliveOnly, rate.isFinite,
+    guard isRunning, renderGate?.isOpen == true, requestGate?.isOpen != false,
+      !keepAliveOnly, rate.isFinite,
       InputRateConverter.supportedDeviceRates.contains(rate)
     else { return }
     let deviceID = expectedInputDeviceID
@@ -299,6 +310,8 @@ final class AudioEngine: @unchecked Sendable {
       logger.warning("Input device rate is not settable; keeping \(self.inputDeviceRate) Hz")
       return
     }
+    // Cancellation can arrive during a blocking HAL capability query too.
+    guard renderGate?.isOpen == true, requestGate?.isOpen != false else { return }
     var value = rate
     let status = AudioObjectSetPropertyData(
       deviceID, &address, 0, nil, UInt32(MemoryLayout<Double>.size), &value)
@@ -708,8 +721,40 @@ final class AudioEngine: @unchecked Sendable {
 
   /// Asks the output device for `requested` and returns the rate the pipeline should use.
   /// A device that cannot take it falls back so the local path never converts silently.
+  /// Sets the output's rate, then its physical format at that rate: the source's own
+  /// bit depth when known (`preferredOutputBits`), otherwise the deepest offered.
   @discardableResult
   private func applyOutputSampleRate(_ requested: Double) -> Double {
+    let rate = applyOutputNominalRate(requested)
+    applyOutputPhysicalFormat(rate: rate)
+    return rate
+  }
+
+  private func applyOutputPhysicalFormat(rate: Double) {
+    let deviceID = expectedOutputDeviceID
+    guard deviceID != kAudioObjectUnknown else { return }
+    let before = outputPhysicalFormat
+    outputPhysicalFormat = DeviceManager.applyOutputFormat(
+      deviceID: deviceID, rate: rate, preferredBits: preferredOutputBits)
+    if let format = outputPhysicalFormat, format != before {
+      logger.notice(
+        "Output physical format: \(Int(format.sampleRate.rounded())) Hz \(format.label)")
+    }
+  }
+
+  /// Source bit depth to reproduce at the DAC (`nil`: deepest available). Applies at
+  /// once while rendering and to every later output-rate change of this run.
+  func requestOutputBitDepth(_ bits: Int?) {
+    dispatchPrecondition(condition: .onQueue(queue))
+    let sanitized = bits.flatMap { (1...64).contains($0) ? $0 : nil }
+    guard preferredOutputBits != sanitized else { return }
+    preferredOutputBits = sanitized
+    guard isRunning, renderGate?.isOpen == true, !keepAliveOnly, outputUnit != nil else { return }
+    applyOutputPhysicalFormat(rate: pipelineRate)
+    publish(phase: status.phase, message: status.message)
+  }
+
+  private func applyOutputNominalRate(_ requested: Double) -> Double {
     let deviceID = expectedOutputDeviceID
     guard deviceID != kAudioObjectUnknown else { return requested }
     guard DeviceManager.isSampleRateAvailable(requested, id: deviceID) else {
@@ -950,6 +995,8 @@ final class AudioEngine: @unchecked Sendable {
     pipelineRate = Self.targetSampleRate
     meterPublishFrames = 4_800
     lastOutputRateNotice = nil
+    outputPhysicalFormat = nil
+    preferredOutputBits = nil
 
     if inUnit != nil || outUnit != nil {
       logger.info("Audio units stopped and disposed")
@@ -1161,10 +1208,12 @@ final class AudioEngine: @unchecked Sendable {
       status.inputSampleRate = inputDeviceRate
       status.inputChannelCount = inputChannels
       status.renderSampleRate = pipelineRate
+      status.outputPhysicalFormat = outputPhysicalFormat
     } else {
       status.inputSampleRate = nil
       status.inputChannelCount = nil
       status.renderSampleRate = nil
+      status.outputPhysicalFormat = nil
     }
     if phase == .running || phase == .keepAlive || phase == .error {
       status.diagnostics = diagnosticsSnapshot()

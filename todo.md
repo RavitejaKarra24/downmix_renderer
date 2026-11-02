@@ -5,7 +5,7 @@ Source: `future.md`. This is the active checklist; that file also contains histo
 ## Scope
 
 - Keep native, local-only 9.1.6 → stereo rendering, the ADC2 matrix, macOS 15 support, ad-hoc signing and the BlackHole workflow. Render at the input device's rate (native passthrough), with 48 kHz only as the output-device fallback.
-- Prioritize audio safety, reliable controls and measured efficiency. Never change system routing or silently select another output. The selected input device's sample rate may follow Music only through the explicit, default-on, opt-out "Match Apple Music's track rate" setting.
+- Prioritize audio safety, reliable controls and measured efficiency. Never change system routing or silently select another output. Input-rate changes require Auto source evidence or explicit Fixed mode; Follow input makes no input-rate requests. The selected output follows captured/DSP rate when supported. No app-default rate guesses.
 - No new accessibility features or accessibility-specific release qualification, per owner request. Existing native behavior and AX hooks remain: the hooks also exercise ordinary controls in automated tests.
 - Do not redo completed engineering, redesign the UI or add effects without a demonstrated need.
 
@@ -90,6 +90,35 @@ Source: `future.md`. This is the active checklist; that file also contains histo
 - [x] Full release suites, rendered UI and isolated HAL Thread Sanitizer checks pass.
 - [x] Universal archive verified; installed 1.6.1 (9). User granted microphone access and played Deva Deva: automatic 44.1→48 kHz matching moved BlackHole, DSP and FIIO to 48 kHz with a stable 2,048-frame queue.
 - [x] User confirms physical-output listening is clear: “now it is good”.
+
+### Universal routed-player handling (1.7.0, build 10)
+
+- [x] Public read-only routed audio-client monitor, uncertainty reporting and generation-safe lifecycle.
+- [x] Auto / Follow input / Fixed modes; migration; unknown/multiple-source hold; exclusive Music metadata only.
+- [x] Revoke queued rate requests on Stop/policy changes; preserve explicit Fixed across source churn.
+- [x] Source/reported/captured/DSP/DAC evidence and all-player routing guidance; no source-Hz inference.
+- [x] Investigate Kew 4.4.2 macOS metadata: no trustworthy current-file/source-rate API; keep manual Fixed/Follow support, no player edits.
+- [x] Source isolation/fault/TSAN, preferences, lifecycle, async cancellation and rendered UI regressions.
+- [x] Universal package/source digest verified and 1.7.0 installed; real native mode/fixed-picker actions verified while stopped.
+- [x] Installed discovery identified Zen and kew + Zen; Auto held the rate. Installed Fixed 48 kHz switched input/DSP/FIIO and settled without ongoing buffer errors.
+- [ ] User listening confirmation; Spotify desktop unavailable.
+- [x] User chose no guessing. Implement strict, PID/freshness-attributed decoder-input log Auto (1.7.1); reject generic output/device logs and app defaults.
+- [x] ALAC fixture live capability probe: logs accessible, no usable source-rate record; this does not verify a real automatic decoder switch.
+- [x] 1.7.1 full release/package/source-digest/signature verification; installed in Automatic mode and microphone access granted. Live Zen source reported unknown and held the prior 96 kHz rate without guesses; initial settled run had zero buffer/render errors.
+- [ ] Real decoder-triggered rate switching and Kew/browser original-rate evidence remain unverified/possibly unavailable. No universal exact-source-rate claim.
+- [ ] Full 96 kHz/multi-hour qualification remains separate.
+
+### Per-client Auto and saved app rates (problem_1.md)
+
+- [x] Resolve Auto from per-client claims: a silent second client no longer blocks Music metadata or decoder evidence; different claimed rates hold and are explained.
+- [x] Decoder-log readers run for every routed client (bounded to six), not only an exclusive one; departed clients' late reports are ignored.
+- [x] Saved per-app rates (bundle ID or name), sanitised on load/save and on entry; one-click "Use current rate"; decoder evidence outranks and, after expiry, still holds over a profile; paused Music claims nothing.
+- [x] Fixed stale preference/lifecycle assertions; lifecycle group 17 covers every problem_1 acceptance criterion.
+- [ ] Live confirmation: Music switching with Zen open, and Kew with a saved rate, on the installed app.
+- [x] DAC bit depth: with every output rate change, select the deepest LPCM physical format offered (FIIO KA13 was left at 16-bit by macOS); report it in Signal path/log; refusal is non-fatal; keep-alive untouched. HAL checks cover selection, apply, no-rewrite, refusal and keep-alive.
+- [x] Local-file Auto: per-client open-file reader (libproc + Core Audio header) gives rate/bit depth/channels for Kew, Elmedia, VLC…; gapless preload/active-read/pause handling; live evidence outranks other apps' saved rates.
+- [x] Match-source DAC depth (default): exact source depth when known (file header or ALAC decoder record), nearest deeper otherwise, deepest for lossy/unknown; depth held while Auto holds; Deepest mode available.
+- [ ] Live confirmation of Kew/Elmedia file switching and DAC depth on the installed app.
 
 ## Feasible follow-through in this session
 

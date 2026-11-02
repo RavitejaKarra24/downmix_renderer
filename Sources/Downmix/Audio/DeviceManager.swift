@@ -275,6 +275,156 @@ enum DeviceManager {
     return ranges
   }
 
+  /// Bit depth and sample kind of an output device's physical (DAC-side) format.
+  struct PhysicalFormat: Equatable, Sendable {
+    let sampleRate: Double
+    let bits: Int
+    let isFloat: Bool
+
+    init(sampleRate: Double, bits: Int, isFloat: Bool) {
+      self.sampleRate = sampleRate
+      self.bits = bits
+      self.isFloat = isFloat
+    }
+
+    init(_ format: AudioStreamBasicDescription) {
+      sampleRate = format.mSampleRate
+      bits = Int(format.mBitsPerChannel)
+      isFloat = format.mFormatFlags & kAudioFormatFlagIsFloat != 0
+    }
+
+    var label: String { "\(bits)-bit \(isFloat ? "float" : "integer")" }
+  }
+
+  /// The deepest linear-PCM physical format offered at `rate` for `channels` channels.
+  /// Downmix delivers a 32-bit float mix (gain, filtering and clock correction already
+  /// applied), so the deepest DAC format keeps all of it. At equal depth an integer
+  /// format wins: it is the DAC's native word.
+  static func deepestPhysicalFormat(
+    in available: [AudioStreamRangedDescription], rate: Double, channels: UInt32
+  ) -> AudioStreamBasicDescription? {
+    physicalFormat(in: available, rate: rate, channels: channels, preferredBits: nil)
+  }
+
+  /// With `preferredBits` (the source's own bit depth), the exact depth when offered,
+  /// else the nearest deeper one, else the deepest. Without it, the deepest.
+  static func physicalFormat(
+    in available: [AudioStreamRangedDescription], rate: Double, channels: UInt32,
+    preferredBits: Int?
+  ) -> AudioStreamBasicDescription? {
+    let candidates = available.compactMap { ranged -> AudioStreamBasicDescription? in
+      var format = ranged.mFormat
+      guard format.mFormatID == kAudioFormatLinearPCM, format.mBitsPerChannel > 0,
+        format.mBitsPerChannel <= 64, format.mChannelsPerFrame == channels
+      else { return nil }
+      if format.mSampleRate == 0 {
+        // A ranged entry: valid for any rate inside its range.
+        guard rate >= ranged.mSampleRateRange.mMinimum - 0.5,
+          rate <= ranged.mSampleRateRange.mMaximum + 0.5
+        else { return nil }
+        format.mSampleRate = rate
+      } else if abs(format.mSampleRate - rate) > 0.5 {
+        return nil
+      }
+      return format
+    }
+    func isInteger(_ format: AudioStreamBasicDescription) -> Int {
+      format.mFormatFlags & kAudioFormatFlagIsFloat != 0 ? 0 : 1
+    }
+    let deepest = candidates.max {
+      ($0.mBitsPerChannel, isInteger($0)) < ($1.mBitsPerChannel, isInteger($1))
+    }
+    guard let preferredBits, preferredBits > 0 else { return deepest }
+    let deepEnough = candidates.filter { Int($0.mBitsPerChannel) >= preferredBits }
+    // Shallowest format that still holds every source bit; integer wins a tie.
+    return deepEnough.min {
+      ($0.mBitsPerChannel, -isInteger($0)) < ($1.mBitsPerChannel, -isInteger($1))
+    } ?? deepest
+  }
+
+  /// Moves every output stream of `deviceID` to the physical format chosen for `rate`
+  /// and `preferredBits` (see `physicalFormat(in:rate:channels:preferredBits:)`). Best
+  /// effort: a refusal leaves the device as it was. Returns the first stream's format.
+  static func applyOutputFormat(
+    deviceID: AudioDeviceID, rate: Double, preferredBits: Int?
+  ) -> PhysicalFormat? {
+    var property = AudioObjectPropertyAddress(
+      mSelector: kAudioDevicePropertyStreams,
+      mScope: kAudioDevicePropertyScopeOutput,
+      mElement: kAudioObjectPropertyElementMain
+    )
+    var size: UInt32 = 0
+    guard AudioObjectGetPropertyDataSize(deviceID, &property, 0, nil, &size) == noErr, size > 0,
+      Int(size).isMultiple(of: MemoryLayout<AudioStreamID>.size)
+    else { return nil }
+    var streams = [AudioStreamID](
+      repeating: 0, count: Int(size) / MemoryLayout<AudioStreamID>.size)
+    guard AudioObjectGetPropertyData(deviceID, &property, 0, nil, &size, &streams) == noErr
+    else { return nil }
+    var result: PhysicalFormat?
+    for stream in streams.prefix(Int(size) / MemoryLayout<AudioStreamID>.size) {
+      guard var current = physicalFormat(stream: stream) else { continue }
+      if let chosen = physicalFormat(
+        in: availablePhysicalFormats(stream: stream), rate: rate,
+        channels: current.mChannelsPerFrame, preferredBits: preferredBits),
+        PhysicalFormat(chosen).bits != PhysicalFormat(current).bits
+          || PhysicalFormat(chosen).isFloat != PhysicalFormat(current).isFloat
+      {
+        var address = AudioObjectPropertyAddress(
+          mSelector: kAudioStreamPropertyPhysicalFormat,
+          mScope: kAudioObjectPropertyScopeGlobal,
+          mElement: kAudioObjectPropertyElementMain
+        )
+        var settable: DarwinBoolean = false
+        var format = chosen
+        if AudioObjectIsPropertySettable(stream, &address, &settable) == noErr,
+          settable.boolValue,
+          AudioObjectSetPropertyData(
+            stream, &address, 0, nil, UInt32(MemoryLayout<AudioStreamBasicDescription>.size),
+            &format) == noErr,
+          let updated = physicalFormat(stream: stream)
+        {
+          current = updated
+        }
+      }
+      if result == nil { result = PhysicalFormat(current) }
+    }
+    return result
+  }
+
+  static func physicalFormat(stream: AudioStreamID) -> AudioStreamBasicDescription? {
+    var address = AudioObjectPropertyAddress(
+      mSelector: kAudioStreamPropertyPhysicalFormat,
+      mScope: kAudioObjectPropertyScopeGlobal,
+      mElement: kAudioObjectPropertyElementMain
+    )
+    var format = AudioStreamBasicDescription()
+    var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+    guard AudioObjectGetPropertyData(stream, &address, 0, nil, &size, &format) == noErr,
+      size == MemoryLayout<AudioStreamBasicDescription>.size, format.mChannelsPerFrame > 0
+    else { return nil }
+    return format
+  }
+
+  static func availablePhysicalFormats(stream: AudioStreamID) -> [AudioStreamRangedDescription] {
+    var address = AudioObjectPropertyAddress(
+      mSelector: kAudioStreamPropertyAvailablePhysicalFormats,
+      mScope: kAudioObjectPropertyScopeGlobal,
+      mElement: kAudioObjectPropertyElementMain
+    )
+    let stride = MemoryLayout<AudioStreamRangedDescription>.size
+    var size: UInt32 = 0
+    guard AudioObjectGetPropertyDataSize(stream, &address, 0, nil, &size) == noErr, size > 0,
+      Int(size).isMultiple(of: stride)
+    else { return [] }
+    var formats = [AudioStreamRangedDescription](
+      repeating: AudioStreamRangedDescription(), count: Int(size) / stride)
+    guard AudioObjectGetPropertyData(stream, &address, 0, nil, &size, &formats) == noErr else {
+      return []
+    }
+    return Array(formats.prefix(Int(size) / stride))
+  }
+
   /// Near-exact match: a device that offers 96 kHz reports it as a point or a small range.
   static func isSampleRateAvailable(_ rate: Double, id: AudioDeviceID) -> Bool {
     guard let ranges = availableNominalRates(id: id) else { return true }

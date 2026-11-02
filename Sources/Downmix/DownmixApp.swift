@@ -12,7 +12,10 @@ struct DownmixApp: App {
     DownmixLog.shared.beginSession(
       version: "\(version) (\(build))",
       details: ["executable=\(Bundle.main.bundlePath)"])
-    let state = AppState(musicRateMonitor: MusicTrackRateMonitor())
+    let state = AppState(
+      musicRateMonitor: MusicTrackRateMonitor(), audioSourceMonitor: AudioSourceMonitor(),
+      decoderRateMonitorFactory: { DecoderRateMonitor() },
+      sourceFileMonitorFactory: { SourceFileMonitor() })
     state.logStartupSummary()
     _appState = State(initialValue: state)
   }

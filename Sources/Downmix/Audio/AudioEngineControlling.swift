@@ -14,8 +14,12 @@ protocol AudioEngineControlling: AnyObject {
   ) throws
   func updateConfiguration(_ configuration: DownmixProcessor.Configuration)
   /// Best-effort: asks the running input device to change its nominal rate. The
-  /// worker reopens the input when the HAL applies it. Never changes the output.
+  /// worker rebuilds the pipeline when the HAL applies it; the selected output follows.
   func setInputSampleRate(_ rate: Double)
+  /// Independently revocable policy authorization, in addition to the audio run gate.
+  func setInputSampleRate(_ rate: Double, requestGate: AudioRateRequest)
+  /// Source bit depth to reproduce at the DAC for this run; `nil` selects the deepest.
+  func setOutputBitDepth(_ bits: Int?)
   func stop()
 }
 
@@ -37,13 +41,31 @@ protocol AudioEngineWorker: AnyObject, Sendable {
   ) throws
   func updateConfiguration(_ configuration: DownmixProcessor.Configuration)
   /// Best-effort: asks the running input device to change its nominal rate. The
-  /// worker reopens the input when the HAL applies it. Never changes the output.
+  /// worker rebuilds the pipeline when the HAL applies it; the selected output follows.
   func requestInputSampleRate(_ rate: Double)
+  func requestInputSampleRate(_ rate: Double, requestGate: AudioRateRequest?)
+  func requestOutputBitDepth(_ bits: Int?)
   func stop()
 }
 
+extension AudioEngineControlling {
+  func setInputSampleRate(_ rate: Double, requestGate: AudioRateRequest) {
+    guard requestGate.isOpen else { return }
+    setInputSampleRate(rate)
+  }
+
+  func setOutputBitDepth(_ bits: Int?) {}
+}
+
 extension AudioEngineWorker {
+  func requestInputSampleRate(_ rate: Double, requestGate: AudioRateRequest?) {
+    guard requestGate?.isOpen != false else { return }
+    requestInputSampleRate(rate)
+  }
+
   var finalDiagnostics: EngineDiagnostics { currentStatus.diagnostics }
+
+  func requestOutputBitDepth(_ bits: Int?) {}
 }
 
 extension AudioEngine: AudioEngineWorker {}

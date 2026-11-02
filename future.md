@@ -440,6 +440,129 @@ errors, a 2,048-frame queue and 0 ppm correction. The user confirmed physical pl
 was clear: “now it is good”. No analog signal capture or multi-hour qualification is
 claimed.
 
+### Universal routed-player policy — 1.7.0 (build 10)
+
+Approved Downmix-only plan: all apps may feed the selected virtual input, with safe
+source-aware Auto, Follow input and explicit Fixed modes. This does not promise original
+file/stream-rate recovery from already-resampled PCM.
+
+Implementation:
+
+- `AudioSourceMonitor` polls public Core Audio process objects on a utility queue while
+  rendering. It filters running output clients by the selected input device's output
+  scope, deduplicates PIDs, excludes the renderer's own PID, and fails closed when relevant
+  activity/route metadata is unreadable. Observations are generation-filtered onto main.
+  Output IO may be silent; polling is not an atomic proof of the currently audible app.
+- `SampleRatePolicy` matches only an exclusive routed Music client with usable adapter
+  metadata. Unknown/zero/multiple clients and discovery failure hold the current rate.
+  Follow input requests no input-rate changes; Fixed requests the chosen rate regardless
+  of player, with the existing explicit DAC fallback. Music is not queried for unrelated
+  browser/local-player playback.
+- Mode/preferences migration preserves the old Music opt-out as Follow input. The Music
+  adapter permission remains independently switchable. Explicit Fixed is not starved or
+  retried by source churn. Auto decisions settle for 1.5 s; Stop/mode/source changes revoke
+  pending automatic authorizations both before dispatch and at the worker boundary.
+- The signal path separates reported metadata, captured PCM, actual worker DSP rate and
+  the selected output's nominal-rate snapshot. It says upstream conversion is unknown
+  when original source metadata is unavailable. Fixed rate is a user request, not proof
+  the original source has that rate. No system/app routing is changed.
+- Fixed an existing AppState propagation omission: worker `renderSampleRate` now reaches
+  the UI. Checklist verification uses the running capture rate, not a stale catalog's
+  nominal rate.
+- Kew 4.4.2 capability inspection found no trustworthy macOS current-track URL/source-Hz
+  IPC. Its Now Playing playback-rate field is speed, not Hz; MPRIS is the Linux path.
+  No Kew edits, private MediaRemote, open-file guessing, library-ID inference or installs.
+  Kew/browser/Spotify original-rate matching therefore remains manual/unknown unless a
+  future supported metadata interface is added.
+
+Verification so far:
+
+- Preferences: mode migration, round trips, malformed fields and bounded fixed rates.
+- Lifecycle 16 groups: exclusive/unknown/multiple clients, stale metadata/source callbacks,
+  failed discovery, Fixed source churn, debounce cancellation and running DSP evidence.
+- Async control 12 groups: queued policy authorization and Stop cancellation with a
+  deliberately blocked worker; real HAL fixtures also exercise closed run/policy gates.
+- New isolated source checks compile the unmodified production monitor with HAL shadows,
+  reject real HAL symbols and cover 18 fault/route/PID scenarios in debug/optimized/TSAN.
+- Rendered UI 12 groups includes rate controls/conditional states, adapter action and
+  source/reported/capture/DSP/DAC elements. Real native picker dispatch remains separate.
+- Read-only monitor probe on this Mac identified a routed Zen browser client and exercised
+  stop/restart/device-change reporting without changing playback or rates.
+
+Full release packaging and installation passed for 1.7.0 (10), including current-source,
+signature and universal archive checks. Real Settings actions exercised mode selection
+and fixed-rate selection while stopped without changing hardware. After the user granted
+microphone access, the installed monitor reported Zen, then kew + Zen, and Auto held
+44.1 kHz. A real Settings action selected Fixed 48 kHz; BlackHole, DSP and FIIO followed.
+Settled heartbeats over a minute had no new underruns/overruns/render errors after the
+transition (93 underruns and 2 transient format errors remained constant; queue 2048,
+correction 0 ppm). This is transport evidence, not user-confirmed listening clarity.
+The user subsequently changed the current rate to 96 kHz; preserve that selection.
+
+User challenged why manual Fixed was needed compared with their SampleRateSwitcher.
+Read-only inspection found its local project uses OSLog decoder-format clues plus optional
+frontmost-app heuristics (browser 48 kHz, Spotify 44.1 kHz). Installed binary symbols also
+contain OSLogSampleRateDetector functions; deep REA analysis was unavailable, and no
+SampleRateSwitcher playback execution/change was performed. Downmix 1.7.0 does not yet
+have that log-detection adapter. Pending decision: add safely attributed decoder-log Auto,
+and whether unverified app-default guesses should be offered separately. Do not claim
+that SampleRateSwitcher or a future log adapter proves every Kew/browser original rate.
+
+Spotify desktop is not installed here; no installed-Spotify runtime claim is made. No
+multi-hour, macOS 15 hardware, analog-signal or every-browser/service qualification claim.
+
+### Strict decoder-log Auto — 1.7.1 (build 11)
+
+The user selected **keep the rate, no guessing** after comparing SampleRateSwitcher.
+Add a decoder-log evidence path to Automatic instead of treating manual Fixed as the
+completed experience. This remains a best-effort detector, not universal original-rate
+recovery.
+
+- `DecoderRateMonitor` reads public OSLogStore on a utility queue only for the exclusive
+  routed client's PID in Automatic mode. It retains numeric observations, not raw logs;
+  denied/unavailable logs are nonfatal. No elevated privileges or private APIs.
+- The parser deliberately accepts only a narrow explicit ALAC decoder INPUT diagnostic
+  with source-depth information. It rejects generic ASBD/AudioQueue/output/device/log
+  feedback, guessed browser/Spotify defaults, unsupported rates and malformed fields.
+  No trustworthy Kew/FLAC diagnostic grammar is yet verified.
+- Records require the selected PID, an allowlisted audio subsystem, a date within four
+  seconds (no future >0.5 s), and a lower bound of monitor start minus 1.5 s. Latest-time
+  conflicts are unknown. Client/mode changes revoke old callbacks and pending requests.
+- A fresh decoder input takes precedence over Music/library metadata. After decoder
+  evidence expires, hold the rate rather than reverting to older cached metadata.
+  Explicit paused Music suppresses lingering decoder logs. Unknown/multiple-source
+  policies remain conservative; Follow input and Fixed do not poll source logs.
+- Lifecycle fixture group 17 covers non-Music decoder evidence, wrong PID/stale records,
+  expiry/no stale fallback, mixed clients, mode changes and Music pause/precedence.
+  Missing Music metadata is distinct from an actual pause, so it cannot reset decoder
+  precedence. Policy authorization carries a monotonic deadline checked again immediately
+  before the HAL setter; a blocked worker cannot apply expired decoder evidence. Request
+  deduplication includes decision identity and revocation, avoiding A/B/A liveness stalls.
+  Newer explicit but unsupported/conflicting decoder inputs invalidate older valid rates.
+  Isolated parser/monitor fixtures cover rejection, bounded selection, lifecycle, reader
+  errors and main-queue stale-delivery filtering; revised HAL/async/lifecycle checks pass.
+
+Live capability check: an owned temporary AVAudioFile helper decoded a known generated
+96 kHz ALAC fixture without audio output. OSLog access was available and PID attribution
+worked, but the production parser found **no usable decoder-input rate record**. This is
+not a successful real decoder-auto-switch test. Kew/browser source-rate automation remains
+unverified and may remain unavailable; do not substitute source metadata fixtures for
+real playback evidence. Final 1.7.1 release checks passed (72,048 DSP/ring assertions,
+17 lifecycle groups, 12 async groups, 12 rendered UI groups, isolated source/decoder/HAL
+fixtures and universal/current-source archive verification). Revised decoder lifecycle
+checks also passed under Thread Sanitizer.
+
+Installed 1.7.1 (11) at `~/Applications/Downmix.app`, signature verified, mode Automatic.
+The user granted microphone permission. An intervening FIIO disconnect stopped the first
+run safely without fallback; after reconnection a new run opened the saved FIIO. Runtime
+source discovery identified Zen with Music paused; the actual Settings summary reported
+no fresh decoder-input evidence and explicitly held the input rate without guesses.
+BlackHole/DSP/FIIO remained at the previously selected 96 kHz; that is retained device PCM,
+not evidence of a 96 kHz browser source. Initial settled heartbeat after reconnection had
+zero underruns/overruns/render errors and a 4,096-frame queue. Real decoder-triggered
+switching and Kew/Spotify original-rate matching remain unverified/unsupported as above.
+Changes are not committed or pushed.
+
 ### Remaining release qualification
 
 1. Multi-hour hardware/audio-quality validation, TCC allow/deny/cancellation, sleep/wake, Bluetooth/USB reconnect, and quarantined installation on a fresh account.

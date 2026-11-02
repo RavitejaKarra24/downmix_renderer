@@ -108,9 +108,25 @@ struct SetupChecklist: Equatable {
   let canRequestPermission: Bool
 }
 
+/// A running decoder-log monitor and the client/generation it reports for.
+private struct DecoderMonitorSlot {
+  let source: AudioPlaybackSource
+  let monitor: any DecoderRateMonitoring
+  let generation: UInt64
+}
+
+/// A running open-file monitor and the client/generation it reports for.
+private struct SourceFileMonitorSlot {
+  let source: AudioPlaybackSource
+  let monitor: any SourceFileMonitoring
+  let generation: UInt64
+}
+
 @MainActor
 @Observable
 final class AppState {
+  /// Each monitor polls unified logs about once a second; bound the total work.
+  static let maximumDecoderMonitors = 6
   var preferences: AppPreferences
   var inputDevices: [AudioDeviceInfo] = []
   var outputDevices: [AudioDeviceInfo] = []
@@ -141,8 +157,33 @@ final class AppState {
   @ObservationIgnored private var notificationObservers: [NotificationObservation] = []
   @ObservationIgnored private let log: any DiagnosticLogging
   @ObservationIgnored private let musicRateMonitor: (any MusicRateMonitoring)?
+  @ObservationIgnored private let audioSourceMonitor: (any AudioSourceMonitoring)?
+  @ObservationIgnored private let makeDecoderRateMonitor:
+    (@MainActor () -> any DecoderRateMonitoring)?
+  /// One decoder-log monitor per routed client: evidence is per client, not exclusive.
+  @ObservationIgnored private var decoderMonitors: [Int32: DecoderMonitorSlot] = [:]
+  @ObservationIgnored private var decoderObservationGeneration: UInt64 = 0
+  private(set) var decoderRates: [Int32: DecoderRateObservation] = [:]
+  private var decoderEvidencePIDs: Set<Int32> = []
+  @ObservationIgnored private let makeSourceFileMonitor:
+    (@MainActor () -> any SourceFileMonitoring)?
+  /// One open-file reader per routed client (local players: Kew, Elmedia, VLC…).
+  @ObservationIgnored private var sourceFileMonitors: [Int32: SourceFileMonitorSlot] = [:]
+  @ObservationIgnored private var sourceFileGeneration: UInt64 = 0
+  private(set) var sourceFiles: [Int32: SourceFileObservation] = [:]
+  /// Last source bit depth sent to the engine this run (outer nil: nothing sent yet).
+  @ObservationIgnored private var sentOutputBitDepth: Int??
+  private var musicIsIdle = false
+  @ObservationIgnored private let rateMatchDelay: Duration
+  @ObservationIgnored private var sourceMonitoringInput: AudioDeviceID?
+  @ObservationIgnored private var sourceMonitorGeneration: UInt64 = 0
+  @ObservationIgnored private var musicObservationGeneration: UInt64 = 0
+  @ObservationIgnored private var rateMatchTask: Task<Void, Never>?
+  @ObservationIgnored private var rateRequestGate: AudioRateRequest?
+  @ObservationIgnored private var pendingRateDecision: SampleRateDecision?
+  private(set) var audioSources = AudioSourceObservation(isAvailable: false)
   @ObservationIgnored private var isMonitoringMusicRate = false
-  @ObservationIgnored private var lastRequestedMusicRate: Double?
+  @ObservationIgnored private var lastRequestedRateDecision: SampleRateDecision?
   /// Last rate Music reported for its current track, for the checklist and log.
   private(set) var detectedMusicRate: Double?
   private(set) var musicRateFailure: MusicRateFailure?
@@ -171,7 +212,11 @@ final class AppState {
     preferenceWriter: @escaping (AppPreferences) throws -> Void = { try $0.save() },
     installListeners: Bool = true,
     log: any DiagnosticLogging = DownmixLog.shared,
-    musicRateMonitor: (any MusicRateMonitoring)? = nil
+    musicRateMonitor: (any MusicRateMonitoring)? = nil,
+    audioSourceMonitor: (any AudioSourceMonitoring)? = nil,
+    decoderRateMonitorFactory: (@MainActor () -> any DecoderRateMonitoring)? = nil,
+    sourceFileMonitorFactory: (@MainActor () -> any SourceFileMonitoring)? = nil,
+    rateMatchDelay: Duration = .milliseconds(1500)
   ) {
     self.engine = engine
     self.preferences = preferences
@@ -188,6 +233,10 @@ final class AppState {
     self.preferenceWriter = preferenceWriter
     self.log = log
     self.musicRateMonitor = musicRateMonitor
+    self.audioSourceMonitor = audioSourceMonitor
+    self.makeDecoderRateMonitor = decoderRateMonitorFactory
+    self.makeSourceFileMonitor = sourceFileMonitorFactory
+    self.rateMatchDelay = rateMatchDelay
     engine.setStatusHandler { [weak self] update in
       // The UI bridge delivers logical intents synchronously and generation-filtered
       // worker snapshots on main, never from a render callback.
@@ -286,9 +335,11 @@ final class AppState {
             }
             let deviceText = Self.rateText(device.nominalSampleRate)
             guard let render = status.renderSampleRate else {
-              return "\(deviceText): the stereo mix follows this rate while rendering."
+              return
+                "\(deviceText): the stereo mix follows this rate while rendering, at the deepest bit depth the device offers."
             }
-            return "\(deviceText): the stereo mix renders at \(Self.rateText(render))."
+            let depth = status.outputPhysicalFormat.map { ", \($0.label) at the DAC" } ?? ""
+            return "\(deviceText): the stereo mix renders at \(Self.rateText(render))\(depth)."
           } ?? "Select an output to read its sample rate."),
         musicRateSetupCheck(input: input),
         SetupCheck(
@@ -303,7 +354,7 @@ final class AppState {
         SetupCheck(
           id: .systemOutput, title: "Playback routed to input", status: .manual,
           guidance:
-            "Manually route your player or Mac sound output to the selected multichannel input. Downmix does not change or certify the system output route."
+            "For any player, browser, YouTube Music or Spotify: set Mac Sound output (or the app\'s own output) to the selected input, and choose your physical DAC as Downmix output. Downmix never changes the default route. Original file/stream rate may be unavailable."
         ),
       ],
       canRequestPermission: authorization == .notDetermined
@@ -335,65 +386,143 @@ final class AppState {
     }
   }
 
-  /// Reports whether the input device is following Music's current track rate. This is
-  /// opt-in: matching changes a system audio setting, so the app never hides it.
+  private var rateDecision: SampleRateDecision {
+    SampleRateDecision.resolve(
+      preferences: preferences, sources: audioSources,
+      musicRate: detectedMusicRate, musicFailure: musicRateFailure,
+      decoderRates: decoderRates, decoderEvidencePIDs: decoderEvidencePIDs,
+      sourceFiles: sourceFiles,
+      musicIsIdle: musicIsIdle)
+  }
+
+  var playbackSourceSummary: String {
+    guard status.phase == .running else { return "Not monitoring while stopped" }
+    guard audioSources.isAvailable else { return "Audio-client discovery unavailable" }
+    guard !audioSources.sources.isEmpty else { return "No active client on the selected input" }
+    return audioSources.sources.map(\.name).joined(separator: ", ")
+  }
+
+  var reportedSourceRateText: String {
+    if case .matching(let rate, let evidence) = rateDecision {
+      if case .file(let pid, _) = evidence, let format = sourceFiles[pid]?.format {
+        return "\(evidence.label): \(format.summary)"
+      }
+      let depth = sourceBitDepth.map { ", \($0)-bit" } ?? ""
+      return "\(evidence.label): \(Self.rateText(rate))\(depth)"
+    }
+    if case .conflictingRates(let rates) = rateDecision {
+      return "Conflicting claims: " + rates.map { Self.rateText($0) }.joined(separator: " / ")
+    }
+    return "Unknown — nothing claimed a rate"
+  }
+
+  var capturedRateText: String {
+    guard status.phase == .running, let rate = status.inputSampleRate else {
+      return "Not capturing"
+    }
+    return Self.rateText(rate)
+  }
+
+  var renderRateText: String {
+    guard status.phase == .running, let rate = status.renderSampleRate else {
+      return "Not rendering"
+    }
+    return Self.rateText(rate)
+  }
+
+  var dacRateText: String {
+    if status.phase == .running, let format = status.outputPhysicalFormat {
+      return "\(Self.rateText(format.sampleRate)), \(format.label)"
+    }
+    return outputDevices.first { $0.id == selectedOutputID }.map {
+      "\(Self.rateText($0.nominalSampleRate)) (device snapshot)"
+    } ?? "No selected output"
+  }
+
+  var sampleRateSummary: String {
+    if preferences.sampleRateMode == .automatic, status.phase != .running {
+      return
+        "Automatic: source detection starts with the renderer. The input rate is unchanged while stopped."
+    }
+    switch rateDecision {
+    case .followingInput:
+      return "Follow input: every routed app is processed at the input device's rate."
+    case .fixed(let rate):
+      return
+        "Fixed \(Self.rateText(rate)); applies while rendering if the input accepts it. The output follows or reports its limit."
+    case .matching(let rate, let evidence):
+      return
+        "Auto: \(evidence.label) claims \(Self.rateText(rate)); applying after a short settling delay."
+    case .conflictingRates(let rates):
+      return
+        "Auto: clients disagree (\(rates.map { Self.rateText($0) }.joined(separator: " vs "))). Holding the current rate instead of picking one."
+    case .decoderLogsUnavailable:
+      return "Auto: decoder logs are unavailable. Keeping the input rate; no app-default guesses."
+    case .discoveryUnavailable:
+      return
+        "Auto: source rate unknown because audio-client discovery is unavailable. Keeping the current input rate."
+    case .awaitingSource:
+      return
+        "Auto: waiting for an audio client routed to the selected input. Keeping the current rate."
+    case .multipleSources:
+      return
+        "Auto: \u{201C}\(playbackSourceSummary)\u{201D} are routed but none claims a rate. Save a rate for the playing app below."
+    case .unknownSource:
+      return
+        "Auto: no rate claimed yet. Save a rate for the playing app below; nothing is guessed."
+    case .awaitingMetadata:
+      return
+        "Auto: Music is paused or has not reported a usable track rate. Keeping the current input rate."
+    case .automationDenied:
+      return
+        "Allow Music metadata access in System Settings → Privacy & Security → Automation, or use Follow input / Fixed."
+    case .invalidRate:
+      return
+        "The requested rate is outside the supported 8–768 kHz band. Keeping the current input rate."
+    }
+  }
+
+  var rateConversionSummary: String {
+    guard status.phase == .running, let capture = status.inputSampleRate,
+      let render = status.renderSampleRate
+    else { return "Start to inspect the captured PCM → DSP → DAC path." }
+    if abs(capture - render) > 0.5 {
+      return
+        "Output limit: captured \(Self.rateText(capture)) is converted to \(Self.rateText(render))."
+    }
+    if let output = outputDevices.first(where: { $0.id == selectedOutputID }),
+      abs(output.nominalSampleRate - render) > 0.5
+    {
+      return "Output rate is settling or differs from the DSP rate; check the selected DAC."
+    }
+    if let source = rateDecision.sourceRate {
+      if abs(source - capture) > 0.5 {
+        return
+          "Source evidence reports \(Self.rateText(source)), but capture is \(Self.rateText(capture)); upstream conversion may already have occurred."
+      }
+      return
+        "Reported source, capture and DSP rates match. Downmix/gain and adaptive clock correction still alter samples."
+    }
+    return
+      "Source rate unknown: upstream conversion cannot be determined. DSP follows captured PCM; adaptive clock correction remains active."
+  }
+
   private func musicRateSetupCheck(input: AudioDeviceInfo?) -> SetupCheck {
-    let title = "Music rate matching"
-    guard preferences.matchMusicSampleRate else {
-      return SetupCheck(
-        id: .musicRate, title: title, status: .manual,
-        guidance:
-          "Off. The input keeps the rate you set in Audio MIDI Setup; turn matching on to follow Music's track rate."
-      )
-    }
-    if musicRateFailure == .automationDenied {
-      return SetupCheck(
-        id: .musicRate, title: title, status: .needsAttention,
-        guidance:
-          "Allow Downmix to control Music in System Settings → Privacy & Security → Automation, then start again."
-      )
-    }
-    if case .scriptFailed(let code) = musicRateFailure {
-      return SetupCheck(
-        id: .musicRate, title: title, status: .manual,
-        guidance:
-          "Music did not report a rate for this track (AppleScript error \(code)). Files opened outside the Music library may not expose one; set the device rate in Audio MIDI Setup."
-      )
-    }
-    guard let rate = detectedMusicRate else {
-      return SetupCheck(
-        id: .musicRate, title: title, status: .manual,
-        guidance:
-          "Play something in Music. Downmix matches the selected input to the current track; files opened outside Music may not report a rate."
-      )
-    }
-    guard InputRateConverter.supportedDeviceRates.contains(rate) else {
-      return SetupCheck(
-        id: .musicRate, title: title, status: .needsAttention,
-        guidance:
-          "Music reports \(Self.rateText(rate)), outside the supported 8–768 kHz band.")
-    }
-    guard let input else {
-      return SetupCheck(
-        id: .musicRate, title: title, status: .manual,
-        guidance: "Music reports \(Self.rateText(rate)). Select an input device to match it.")
-    }
-    if abs(input.nominalSampleRate - rate) <= 0.5 {
-      return SetupCheck(
-        id: .musicRate, title: title, status: .verified,
-        guidance:
-          "Music \(Self.rateText(rate)) · input \(Self.rateText(rate)). Downmix renders at the device rate."
-      )
+    let checkStatus: SetupCheck.Status
+    switch rateDecision {
+    case .automationDenied, .invalidRate, .conflictingRates: checkStatus = .needsAttention
+    case .fixed(let rate), .matching(let rate, _):
+      let actual = status.phase == .running ? status.inputSampleRate : input?.nominalSampleRate
+      checkStatus = actual.map { abs($0 - rate) <= 0.5 } == true ? .verified : .manual
+    default: checkStatus = .manual
     }
     return SetupCheck(
-      id: .musicRate, title: title, status: .manual,
-      guidance:
-        "Music \(Self.rateText(rate)) · input \(Self.rateText(input.nominalSampleRate)). Waiting for the device to switch."
-    )
+      id: .musicRate, title: "Sample-rate policy", status: checkStatus,
+      guidance: sampleRateSummary)
   }
 
   private static func rateText(_ rate: Double) -> String {
-    guard rate.isFinite, rate > 0 else { return "No sample rate" }
+    guard rate.isFinite, rate > 0, rate < Double(Int.max) else { return "No usable sample rate" }
     return "\(Int(rate.rounded())) Hz"
   }
 
@@ -403,7 +532,8 @@ final class AppState {
       return "\(deviceText): the stereo mix renders at this rate when the output supports it."
     }
     if abs(renderRate - deviceRate) <= 0.5 {
-      return "\(deviceText) in, rendered at \(Self.rateText(renderRate)) with no conversion."
+      return
+        "\(deviceText) in and rendered at the same nominal rate; adaptive clock correction remains active."
     }
     return
       "\(rateText(deviceRate)): the output device cannot accept it, so the mix renders at \(rateText(renderRate))."
@@ -440,67 +570,372 @@ final class AppState {
       + "\(device.outputChannelCount)out \(rate)Hz]"
   }
 
-  /// Starts/stops Music rate polling with the renderer and the preference. Safe to call
-  /// on every status publication: the monitor ignores a redundant start.
+  /// Audio-client discovery is independent of rate mode. Metadata is read only for
+  /// a supported, exclusive routed client, never for unrelated background Music.
   private func syncMusicRateMonitoring() {
-    let shouldMonitor = preferences.matchMusicSampleRate && isRunning && !isKeepingOutputAwake
+    let desiredInput = status.phase == .running && !isKeepingOutputAwake ? selectedInputID : nil
+    if sourceMonitoringInput != desiredInput {
+      audioSourceMonitor?.stop()
+      sourceMonitorGeneration &+= 1
+      sourceMonitoringInput = desiredInput
+      audioSources = AudioSourceObservation(isAvailable: false)
+      cancelRateMatch()
+      if let desiredInput {
+        let generation = sourceMonitorGeneration
+        audioSourceMonitor?.start(inputDeviceID: desiredInput) { [weak self] observation in
+          MainActor.assumeIsolated {
+            guard let self, self.sourceMonitorGeneration == generation,
+              self.sourceMonitoringInput == desiredInput
+            else { return }
+            self.receiveAudioSources(observation)
+          }
+        }
+      }
+    }
+    syncDecoderMonitoring(monitoring: desiredInput != nil)
+    syncSourceFileMonitoring(monitoring: desiredInput != nil)
+    let shouldMonitor =
+      preferences.sampleRateMode == .automatic && preferences.matchMusicSampleRate
+      && audioSources.sources.contains {
+        $0.bundleIdentifier == SampleRateDecision.musicBundleIdentifier
+      }
     guard shouldMonitor != isMonitoringMusicRate else { return }
     isMonitoringMusicRate = shouldMonitor
+    musicObservationGeneration &+= 1
     guard shouldMonitor else {
       musicRateMonitor?.stop()
       detectedMusicRate = nil
       musicRateFailure = nil
-      lastRequestedMusicRate = nil
+      musicIsIdle = false
       return
     }
+    musicIsIdle = false
+    let generation = musicObservationGeneration
     musicRateMonitor?.start { [weak self] observation in
-      MainActor.assumeIsolated { self?.receiveMusicRate(observation) }
+      MainActor.assumeIsolated {
+        guard let self, self.musicObservationGeneration == generation,
+          self.isMonitoringMusicRate
+        else { return }
+        self.receiveMusicRate(observation)
+      }
     }
+  }
+
+  /// Decoder logs are read for every routed client in Automatic mode (bounded), so a
+  /// silent second client no longer hides a playing client's decoder evidence.
+  private func syncDecoderMonitoring(monitoring: Bool) {
+    let desired: [AudioPlaybackSource] =
+      monitoring && preferences.sampleRateMode == .automatic && audioSources.isAvailable
+      ? Array(audioSources.sources.prefix(Self.maximumDecoderMonitors)) : []
+    var desiredByPID: [Int32: AudioPlaybackSource] = [:]
+    for source in desired where desiredByPID[source.id] == nil {
+      desiredByPID[source.id] = source
+    }
+    for (pid, slot) in decoderMonitors where desiredByPID[pid] != slot.source {
+      slot.monitor.stop()
+      decoderMonitors[pid] = nil
+      decoderRates[pid] = nil
+      decoderEvidencePIDs.remove(pid)
+    }
+    // Observations for clients that are gone must not linger.
+    decoderRates = decoderRates.filter { decoderMonitors[$0.key] != nil }
+    decoderEvidencePIDs.formIntersection(decoderMonitors.keys)
+    guard let makeDecoderRateMonitor else { return }
+    for source in desired where decoderMonitors[source.id] == nil {
+      decoderObservationGeneration &+= 1
+      let generation = decoderObservationGeneration
+      let monitor = makeDecoderRateMonitor()
+      decoderMonitors[source.id] = DecoderMonitorSlot(
+        source: source, monitor: monitor, generation: generation)
+      monitor.start(source: source) { [weak self] observation in
+        MainActor.assumeIsolated {
+          guard let self, let slot = self.decoderMonitors[source.id],
+            slot.generation == generation, slot.source == source
+          else { return }
+          self.receiveDecoderRate(observation, from: source)
+        }
+      }
+    }
+  }
+
+  /// Open-file readers follow the same per-client lifecycle as decoder-log readers.
+  private func syncSourceFileMonitoring(monitoring: Bool) {
+    let desired: [AudioPlaybackSource] =
+      monitoring && preferences.sampleRateMode == .automatic && audioSources.isAvailable
+      ? Array(audioSources.sources.prefix(Self.maximumDecoderMonitors)) : []
+    var desiredByPID: [Int32: AudioPlaybackSource] = [:]
+    for source in desired where desiredByPID[source.id] == nil {
+      desiredByPID[source.id] = source
+    }
+    for (pid, slot) in sourceFileMonitors where desiredByPID[pid] != slot.source {
+      slot.monitor.stop()
+      sourceFileMonitors[pid] = nil
+      sourceFiles[pid] = nil
+    }
+    sourceFiles = sourceFiles.filter { sourceFileMonitors[$0.key] != nil }
+    guard let makeSourceFileMonitor else { return }
+    for source in desired where sourceFileMonitors[source.id] == nil {
+      sourceFileGeneration &+= 1
+      let generation = sourceFileGeneration
+      let monitor = makeSourceFileMonitor()
+      sourceFileMonitors[source.id] = SourceFileMonitorSlot(
+        source: source, monitor: monitor, generation: generation)
+      monitor.start(source: source) { [weak self] observation in
+        MainActor.assumeIsolated {
+          guard let self, let slot = self.sourceFileMonitors[source.id],
+            slot.generation == generation, slot.source == source
+          else { return }
+          self.receiveSourceFile(observation, from: source)
+        }
+      }
+    }
+  }
+
+  private func receiveSourceFile(
+    _ observation: SourceFileObservation, from source: AudioPlaybackSource
+  ) {
+    guard observation.sourcePID == source.id, sourceFiles[source.id] != observation else {
+      return
+    }
+    sourceFiles[source.id] = observation
+    if let format = observation.format {
+      // The file name stays local to this log; full paths are never recorded.
+      log.log(
+        .info, "source-file",
+        "app=\(source.name) pid=\(source.id) format=\(format.summary)\(observation.isIdle ? " idle" : "")"
+      )
+    } else if observation.isAmbiguous {
+      log.log(.info, "source-file", "app=\(source.name) pid=\(source.id) ambiguous open files")
+    }
+    applyRatePolicy()
+  }
+
+  private func receiveDecoderRate(
+    _ observation: DecoderRateObservation, from source: AudioPlaybackSource
+  ) {
+    // A record attributed to any other PID cannot speak for this client.
+    guard observation.sourcePID == source.id else { return }
+    decoderRates[source.id] = observation
+    if observation.isAvailable, let date = observation.date,
+      DecoderInputRateParser.isFresh(date, now: Date())
+    {
+      decoderEvidencePIDs.insert(source.id)
+      if let rate = observation.sampleRate, InputRateConverter.supportedDeviceRates.contains(rate) {
+        log.log(
+          .info, "decoder-rate",
+          "app=\(source.name) pid=\(source.id) inputRate=\(Int(rate.rounded()))Hz evidenceDate=\(date.timeIntervalSince1970)"
+        )
+      }
+    }
+    applyRatePolicy()
+  }
+
+  private func receiveAudioSources(_ observation: AudioSourceObservation) {
+    guard audioSources != observation else { return }
+    audioSources = observation
+    if preferences.sampleRateMode == .automatic {
+      cancelRateMatch()
+    }
+    // A new PID/client set invalidates even a previously supported adapter's metadata.
+    if isMonitoringMusicRate {
+      isMonitoringMusicRate = false
+      musicObservationGeneration &+= 1
+      musicRateMonitor?.stop()
+      detectedMusicRate = nil
+      musicRateFailure = nil
+    }
+    log.log(
+      .info, "sources",
+      "discovery=\(observation.isAvailable) clients=\(observation.sources.map(\.name).joined(separator: ", "))"
+    )
+    syncMusicRateMonitoring()
+    applyRatePolicy()
   }
 
   private func receiveMusicRate(_ observation: MusicRateObservation) {
     switch observation {
     case .playing(let rate, let track):
+      musicIsIdle = false
       if detectedMusicRate != rate {
         log.log(
           .info, "music",
-          "track=\(track.isEmpty ? "-" : track) reportedRate=\(Int(rate.rounded()))Hz")
+          "track=\(track.isEmpty ? "-" : track) reportedRate=\(Self.rateText(rate))")
       }
       detectedMusicRate = rate
       musicRateFailure = nil
-      applyDetectedMusicRate(rate)
     case .idle:
-      if detectedMusicRate != nil {
-        log.log(.info, "music", "Music is not playing; leaving the input rate unchanged")
+      musicIsIdle = true
+      // A pause ends Music's playback episode; other clients keep their evidence.
+      for source in audioSources.sources
+      where source.bundleIdentifier == SampleRateDecision.musicBundleIdentifier {
+        decoderRates[source.id] = nil
+        decoderEvidencePIDs.remove(source.id)
       }
       detectedMusicRate = nil
       musicRateFailure = nil
-      lastRequestedMusicRate = nil
+    case .metadataUnavailable:
+      musicIsIdle = false
+      detectedMusicRate = nil
+      musicRateFailure = nil
+    // Missing metadata is not a new playback episode; retain decoder precedence.
     case .failure(let failure):
+      musicIsIdle = false
       if musicRateFailure != failure {
         log.log(.warning, "music", "rate reading failed: \(Self.describe(failure))")
       }
+      detectedMusicRate = nil
       musicRateFailure = failure
+    }
+    applyRatePolicy()
+  }
+
+  var routedApps: [AudioPlaybackSource] { audioSources.sources }
+
+  /// Apps currently routed to the input, with any saved declaration.
+  var routedAppRows: [(source: AudioPlaybackSource, savedRate: Double?)] {
+    audioSources.sources.map {
+      ($0, preferences.appRateProfiles[SampleRateDecision.profileKey(for: $0)])
     }
   }
 
-  /// Requests the running input device's rate. The worker reopens the pipeline when the
-  /// HAL applies it; the output device follows the source rate.
-  private func applyDetectedMusicRate(_ rate: Double) {
-    guard preferences.matchMusicSampleRate, status.phase == .running,
-      let input = inputDevices.first(where: { $0.id == selectedInputID })
+  /// The live captured input rate, offered as a one-click declaration for a routed app
+  /// ("this app plays at the rate the device is at now"). Nil while stopped or when the
+  /// device sits at a rate that cannot be saved.
+  var currentRateForProfile: Double? {
+    guard status.phase == .running, let live = status.inputSampleRate else { return nil }
+    return AppPreferences.selectableSampleRates.first { abs($0 - live) <= 0.5 }
+  }
+
+  func saveCurrentRateProfile(for key: String) {
+    guard let rate = currentRateForProfile else { return }
+    saveRateProfile(rate, for: key)
+  }
+
+  /// Profiles use the same bounds as persistence, so a saved rate never vanishes on reload.
+  func saveRateProfile(_ rate: Double, for key: String) {
+    guard AppPreferences.selectableSampleRates.contains(rate),
+      !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, key.count <= 256
     else { return }
-    guard InputRateConverter.supportedDeviceRates.contains(rate) else { return }
-    if abs(input.nominalSampleRate - rate) <= 0.5 {
-      lastRequestedMusicRate = nil
+    preferences.appRateProfiles[key] = rate
+    cancelRateMatch()
+    persist()
+    applyRatePolicy()
+  }
+
+  func removeRateProfile(for key: String) {
+    guard preferences.appRateProfiles.removeValue(forKey: key) != nil else { return }
+    cancelRateMatch()
+    persist()
+    applyRatePolicy()
+  }
+
+  func rateSettingsChanged() {
+    cancelRateMatch()
+    persist()
+    applyRatePolicy()
+  }
+
+  private func cancelRateMatch() {
+    rateRequestGate?.close()
+    rateRequestGate = nil
+    lastRequestedRateDecision = nil
+    rateMatchTask?.cancel()
+    rateMatchTask = nil
+    pendingRateDecision = nil
+  }
+
+  /// Both Auto and explicit Fixed use the existing serialized HAL request/rebuild
+  /// path. Unknown/multiple sources hold the device rate, not an assumed 48 kHz.
+  /// Source bit depth stated by the evidence that won the rate decision, if any.
+  var sourceBitDepth: Int? {
+    guard case .matching(_, let evidence) = rateDecision else { return nil }
+    switch evidence {
+    case .decoder(let pid): return decoderRates[pid]?.bitDepth
+    case .file(let pid, _): return sourceFiles[pid]?.format?.bitDepth
+    case .profile, .music: return nil
+    }
+  }
+
+  /// Tells the engine which bit depth the DAC should run at: the winning source's own
+  /// depth in Match-source mode (deepest when unknown or lossy), the deepest otherwise.
+  /// While Auto holds the rate, the depth is held too, so a gap between tracks does not
+  /// flip the DAC's format.
+  private func syncOutputBitDepth() {
+    guard status.phase == .running, !isKeepingOutputAwake else {
+      sentOutputBitDepth = nil
       return
     }
-    guard lastRequestedMusicRate != rate else { return }
-    lastRequestedMusicRate = rate
-    engine.setInputSampleRate(rate)
+    let desired: Int?
+    switch rateDecision {
+    case .matching:
+      desired = preferences.outputBitDepthMode == .matchSource ? sourceBitDepth : nil
+    case .fixed, .followingInput:
+      desired = nil
+    default:
+      guard preferences.outputBitDepthMode == .deepest else { return }
+      desired = nil
+    }
+    guard sentOutputBitDepth != .some(desired) else { return }
+    sentOutputBitDepth = .some(desired)
+    engine.setOutputBitDepth(desired)
     log.log(
-      .info, "music",
-      "requested input=\(Self.deviceSummary(input)) rate=\(Int(rate.rounded()))Hz")
+      .info, "output-format",
+      "requestedBitDepth=\(desired.map { "\($0)-bit (source)" } ?? "deepest")")
+  }
+
+  private func applyRatePolicy() {
+    syncOutputBitDepth()
+    let decision = rateDecision
+    guard status.phase == .running, let rate = decision.requestedRate,
+      InputRateConverter.supportedDeviceRates.contains(rate),
+      let input = inputDevices.first(where: { $0.id == selectedInputID })
+    else {
+      cancelRateMatch()
+      return
+    }
+    let liveRate = status.inputSampleRate ?? input.nominalSampleRate
+    if abs(liveRate - rate) <= 0.5 {
+      cancelRateMatch()
+      return
+    }
+    if lastRequestedRateDecision == decision, rateRequestGate?.isOpen == true { return }
+    guard pendingRateDecision != decision else { return }
+    cancelRateMatch()
+    pendingRateDecision = decision
+    if rateMatchDelay == .zero {
+      requestInputRate(rate, decision: decision)
+      return
+    }
+    rateMatchTask = Task { [weak self] in
+      guard let delay = self?.rateMatchDelay else { return }
+      do { try await Task.sleep(for: delay) } catch { return }
+      guard !Task.isCancelled else { return }
+      self?.requestInputRate(rate, decision: decision)
+    }
+  }
+
+  private func requestInputRate(_ rate: Double, decision: SampleRateDecision) {
+    guard status.phase == .running, rateDecision == decision,
+      pendingRateDecision == decision,
+      let input = inputDevices.first(where: { $0.id == selectedInputID })
+    else { return }
+    pendingRateDecision = nil
+    lastRequestedRateDecision = decision
+    let expiration: Date?
+    if case .matching(_, let evidence) = rateDecision, case .decoder(let pid) = evidence,
+      let date = decoderRates[pid]?.date
+    {
+      expiration = date.addingTimeInterval(DecoderInputRateParser.maximumAge)
+    } else {
+      expiration = nil
+    }
+    let requestGate = AudioRateRequest(expiresAt: expiration)
+    rateRequestGate = requestGate
+    engine.setInputSampleRate(rate, requestGate: requestGate)
+    log.log(
+      .info, "rate-policy",
+      "mode=\(preferences.sampleRateMode.rawValue) input=\(Self.deviceSummary(input)) requestedRate=\(Int(rate.rounded()))Hz"
+    )
   }
 
   private static func describe(_ failure: MusicRateFailure) -> String {
@@ -608,7 +1043,7 @@ final class AppState {
     selectedInputID = device.id
     preferences.inputDeviceUID = device.uid
     preferences.inputDeviceName = device.name
-    lastRequestedMusicRate = nil
+    cancelRateMatch()
     persist()
     if restart { start() }
   }
@@ -652,6 +1087,7 @@ final class AppState {
       startKeepAliveIfNeeded()
     }
     syncMusicRateMonitoring()
+    applyRatePolicy()
   }
 
   func toggle() {
@@ -880,6 +1316,17 @@ final class AppState {
     if status.inputChannelCount != update.inputChannelCount {
       status.inputChannelCount = update.inputChannelCount
     }
+    if status.renderSampleRate != update.renderSampleRate {
+      status.renderSampleRate = update.renderSampleRate
+    }
+    if status.outputPhysicalFormat != update.outputPhysicalFormat {
+      if let format = update.outputPhysicalFormat {
+        log.log(
+          .info, "output-format",
+          "dac=\(Int(format.sampleRate.rounded()))Hz \(format.label)")
+      }
+      status.outputPhysicalFormat = update.outputPhysicalFormat
+    }
     let isInactive = update.phase == .stopped || update.phase == .error
     var nextDiagnostics = update.phase == .stopped ? EngineDiagnostics.empty : update.diagnostics
     // Keep final failure counts available for diagnosis, without suggesting audio is queued
@@ -905,9 +1352,7 @@ final class AppState {
       errorMessage = update.message
     }
     syncMusicRateMonitoring()
-    if let rate = detectedMusicRate, status.phase == .running {
-      applyDetectedMusicRate(rate)
-    }
+    applyRatePolicy()
   }
 
   /// One log line per visible status transition, plus full failure counters.

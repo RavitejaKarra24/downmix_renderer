@@ -666,10 +666,152 @@ func inputRateRequestChecks() throws {
   keepAlive.stop()
 
   stubHAL.reset()
+  let runGate = AudioRenderGate()
+  let guarded = try startEngine(gate: runGate)
+  let policyGate = AudioRateRequest()
+  policyGate.close()
+  guarded.checkRequestInputRate(
+    88_200, requestGate: AudioRateRequest(expiresAt: Date().addingTimeInterval(-1)))
+  require(stubHAL.devices[101]!.rate == 48_000, "Expired decoder evidence cannot change actual HAL")
+  guarded.checkRequestInputRate(96_000, requestGate: policyGate)
+  require(
+    stubHAL.devices[101]!.rate == 48_000, "A revoked policy cannot change the actual HAL device")
+  runGate.close()
+  guarded.checkRequestInputRate(96_000)
+  require(
+    stubHAL.devices[101]!.rate == 48_000, "Immediate Stop gate blocks rates before queued teardown")
+  guarded.stop()
+
+  stubHAL.reset()
   let stopped = AudioEngine(queue: checkQueue)
   stopped.checkRequestInputRate(96_000)
   require(stubHAL.devices[101]!.rate == 48_000, "A stopped engine never changes system audio")
   print("PASS: actual-engine input rate requests for Music matching")
+}
+
+func outputBitDepthChecks() throws {
+  // Pure selection: deepest LPCM at the rate and width; integer wins a tie with float.
+  func ranged(
+    _ bits: UInt32, rate: Double = 0, channels: UInt32 = 2, float: Bool = false,
+    range: (Double, Double) = (44_100, 384_000)
+  ) -> AudioStreamRangedDescription {
+    var format = stubIntegerFormat(rate: rate, channels: channels, bits: bits)
+    if float { format.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked }
+    return AudioStreamRangedDescription(
+      mFormat: format, mSampleRateRange: AudioValueRange(mMinimum: range.0, mMaximum: range.1))
+  }
+  let mixed = [
+    ranged(16), ranged(24), ranged(32, float: true), ranged(32), ranged(64, channels: 4),
+    ranged(48, rate: 48_000),
+  ]
+  let best = DeviceManager.deepestPhysicalFormat(in: mixed, rate: 96_000, channels: 2)
+  require(best?.mBitsPerChannel == 32, "Deepest stereo format at the rate is chosen")
+  require(
+    best.map { $0.mFormatFlags & kAudioFormatFlagIsFloat == 0 } == true,
+    "Integer wins a depth tie with float")
+  require(best?.mSampleRate == 96_000, "A ranged entry is pinned to the requested rate")
+  require(
+    DeviceManager.deepestPhysicalFormat(in: mixed, rate: 48_000, channels: 2)?.mBitsPerChannel
+      == 48,
+    "An exact-rate entry only counts at its rate")
+  require(
+    DeviceManager.deepestPhysicalFormat(
+      in: [ranged(24, range: (44_100, 48_000))], rate: 96_000, channels: 2) == nil,
+    "Formats outside their rate range are excluded")
+  var compressed = ranged(32)
+  compressed.mFormat.mFormatID = kAudioFormatAC3
+  require(
+    DeviceManager.deepestPhysicalFormat(in: [compressed, ranged(16)], rate: 96_000, channels: 2)?
+      .mBitsPerChannel == 16,
+    "Only linear PCM qualifies")
+
+  // Actual engine: a DAC left at 16-bit is moved to its deepest format on start.
+  stubHAL.reset()
+  stubHAL.devices[101]!.rate = 96_000
+  let engine = try startEngine()
+  require(stubHAL.devices[201]!.rate == 96_000, "Output follows the input rate")
+  require(stubHAL.devices[201]!.physicalBits == 32, "16-bit DAC format is raised to 32-bit")
+  require(stubHAL.devices[201]!.physicalFormatWrites == 1, "One physical format write")
+  require(
+    engine.currentStatus.outputPhysicalFormat?.bits == 32
+      && engine.currentStatus.outputPhysicalFormat?.isFloat == false,
+    "Status reports the DAC's 32-bit integer format")
+  // A rate reopen re-applies the policy without redundant writes.
+  stubHAL.devices[101]!.rate = 44_100
+  _ = stubHAL.inputCallback(frames: 512)
+  engine.checkWatchdogTick()
+  require(engine.currentStatus.renderSampleRate == 44_100, "Rate change reopens the pipeline")
+  require(stubHAL.devices[201]!.physicalBits == 32, "Depth survives a rate change")
+  require(
+    stubHAL.devices[201]!.physicalFormatWrites == 1, "Already-deepest format is not rewritten")
+  engine.stop()
+  require(engine.currentStatus.outputPhysicalFormat == nil, "Stopped status reports no format")
+
+  // A DAC that refuses the change keeps rendering at its own depth, and reports it.
+  stubHAL.reset()
+  stubHAL.devices[201]!.physicalFormatSettable = false
+  let refused = try startEngine()
+  require(refused.currentStatus.phase == .running, "A refused depth change never stops audio")
+  require(stubHAL.devices[201]!.physicalBits == 16, "Unsettable format is left alone")
+  require(refused.currentStatus.outputPhysicalFormat?.bits == 16, "The real depth is reported")
+  refused.stop()
+
+  // Nothing deeper offered: no write. Keep-alive never touches the DAC format.
+  stubHAL.reset()
+  stubHAL.devices[201]!.availableBits = [16]
+  let shallow = try startEngine()
+  require(stubHAL.devices[201]!.physicalFormatWrites == 0, "No deeper format means no write")
+  shallow.stop()
+  stubHAL.reset()
+  let keepAlive = try startEngine(keepAlive: true)
+  require(stubHAL.devices[201]!.physicalFormatWrites == 0, "Keep-alive leaves the DAC format")
+  keepAlive.stop()
+  // Match-source: exact depth when offered, else the nearest deeper, else the deepest.
+  let offered = [ranged(16), ranged(24), ranged(32), ranged(32, float: true)]
+  func pick(_ bits: Int?) -> UInt32? {
+    DeviceManager.physicalFormat(in: offered, rate: 96_000, channels: 2, preferredBits: bits)?
+      .mBitsPerChannel
+  }
+  require(pick(16) == 16 && pick(24) == 24 && pick(32) == 32, "Offered depths match exactly")
+  require(pick(20) == 24, "An unoffered depth takes the nearest deeper format")
+  require(pick(48) == 32, "A depth deeper than any offered takes the deepest")
+  require(pick(nil) == 32, "Unknown source depth takes the deepest")
+  require(
+    DeviceManager.physicalFormat(in: offered, rate: 96_000, channels: 2, preferredBits: 32)
+      .map { $0.mFormatFlags & kAudioFormatFlagIsFloat == 0 } == true,
+    "Integer wins the exact-depth tie")
+
+  // Actual engine: a known source depth is applied at once, kept across a rate reopen,
+  // and released back to the deepest when the source depth becomes unknown.
+  stubHAL.reset()
+  stubHAL.devices[101]!.rate = 96_000
+  let matching = try startEngine()
+  require(stubHAL.devices[201]!.physicalBits == 32, "Start uses the deepest before evidence")
+  matching.requestOutputBitDepth(24)
+  require(stubHAL.devices[201]!.physicalBits == 24, "A 24-bit source sets the DAC to 24-bit")
+  require(
+    matching.currentStatus.outputPhysicalFormat?.bits == 24, "Status reports the matched depth")
+  matching.requestOutputBitDepth(16)
+  require(stubHAL.devices[201]!.physicalBits == 16, "A 16-bit source sets the DAC to 16-bit")
+  stubHAL.devices[101]!.rate = 44_100
+  _ = stubHAL.inputCallback(frames: 512)
+  matching.checkWatchdogTick()
+  require(matching.currentStatus.renderSampleRate == 44_100, "Rate change reopens")
+  require(stubHAL.devices[201]!.physicalBits == 16, "The source depth survives the reopen")
+  let writes = stubHAL.devices[201]!.physicalFormatWrites
+  matching.requestOutputBitDepth(16)
+  require(stubHAL.devices[201]!.physicalFormatWrites == writes, "Repeated depth is not rewritten")
+  matching.requestOutputBitDepth(nil)
+  require(stubHAL.devices[201]!.physicalBits == 32, "Unknown depth returns to the deepest")
+  matching.stop()
+  stubHAL.reset()
+  let idle = try startEngine(keepAlive: true)
+  idle.requestOutputBitDepth(16)
+  require(stubHAL.devices[201]!.physicalFormatWrites == 0, "Keep-alive ignores depth requests")
+  idle.stop()
+  print(
+    "PASS: DAC bit depth: deepest/exact/nearest-deeper selection, live apply, reopen, refusal, keep-alive"
+  )
 }
 
 checkQueue.async {
@@ -682,6 +824,7 @@ checkQueue.async {
     try deviceRateAndWidthChecks()
     try rateTransitionDeliveryChecks()
     try inputRateRequestChecks()
+    try outputBitDepthChecks()
     try cleanupChecks()
     print("All isolated HAL checks passed (no hardware or system routes touched)")
     exit(0)

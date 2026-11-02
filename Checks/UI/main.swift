@@ -330,6 +330,7 @@ private struct UIChecks {
         try contentChecks()
         try favoriteViewChecks()
         try settingsChecks()
+        try sampleRateViewChecks()
         try menuChecks()
         try retryWarmupChecks()
         try persistenceErrorChecks()
@@ -338,7 +339,7 @@ private struct UIChecks {
         try diagnosticsChecks()
         try reducedMotionChecks()
         print(
-          "PASS UI: 11 groups (1 deterministic ordering + 10 rendered native; in-process NSAccessibility actions, fake backend)"
+          "PASS UI: 12 groups (1 deterministic ordering + 11 rendered native; in-process NSAccessibility actions, fake backend)"
         )
       } else {
         try hostingChecks()
@@ -721,6 +722,47 @@ private struct UIChecks {
       "Settings use fake writer only")
     print(
       "PASS SettingsView: native tabs, transport, buffer restart, keep-alive, auto-start/preamp/swap, fake persistence"
+    )
+  }
+
+  @MainActor
+  private static func sampleRateViewChecks() throws {
+    let fixture = UIFixture()
+    let state = fixture.state()
+    let hosted = HostedWindow(
+      VStack {
+        SampleRateControls()
+        RateSignalPathView()
+      }, state: state,
+      rendered: true, size: NSSize(width: 600, height: 1000))
+    defer { hosted.close() }
+    let mode = try hosted.find("settings.sampleRateMode")
+    try require(mode.isAccessibilityEnabled(), "Native mode picker is enabled")
+    for id in [
+      "rate.source", "rate.reported", "rate.capture", "rate.render", "rate.dac", "rate.conversion",
+    ] {
+      _ = try hosted.find(id)
+    }
+    try hosted.press("settings.matchMusicRate")
+    try require(
+      !state.preferences.matchMusicSampleRate, "Native Music adapter control changes preference")
+    // Render each conditional mode. This checks view/state wiring, not a claim of
+    // real scene/menu dispatch; actual installed picker actions are qualified separately.
+    state.preferences.sampleRateMode = .fixed
+    state.preferences.fixedSampleRate = 96_000
+    state.rateSettingsChanged()
+    hosted.settle()
+    _ = try hosted.find("settings.fixedSampleRate")
+    try require(state.sampleRateSummary.contains("96000"), "Fixed mode reports its configured rate")
+    state.preferences.sampleRateMode = .followInput
+    state.rateSettingsChanged()
+    hosted.settle()
+    try require(
+      !hosted.elements.contains { $0.accessibilityIdentifier() == "settings.fixedSampleRate" },
+      "Follow input hides the inactive fixed-rate control")
+    try require(fixture.engine.starts.isEmpty, "Rate controls do not start stopped audio")
+    print(
+      "PASS sample-rate UI: mode states, adapter action, fixed control and source/capture/DSP/DAC evidence"
     )
   }
 

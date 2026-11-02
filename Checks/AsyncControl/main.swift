@@ -265,7 +265,57 @@ struct AsyncControlChecks {
     try await permissionAndFailureCleanup()
     try await reentrantCommands()
     try await deinitLifetime()
-    print("All async audio control checks passed (11 groups; no real HAL units opened)")
+    try await rateRequestCancellation()
+    print("All async audio control checks passed (12 groups; no real HAL units opened)")
+  }
+
+  @MainActor
+  static func rateRequestCancellation() async throws {
+    let f = Fixture(block: true)
+    try f.start()
+    try await eventually("Blocked worker did not start") { f.probe.snapshot.starts.count == 1 }
+    let revoked = AudioRateRequest()
+    f.controller?.setInputSampleRate(96_000, requestGate: revoked)
+    revoked.close()  // Mode/source changed after dispatch, before the worker executes.
+    f.probe.release.signal()
+    await f.drainWorker()
+    try require(
+      !f.probe.snapshot.events.contains("rate-96000"),
+      "Revoked queued policy request reached worker")
+    let valid = AudioRateRequest()
+    f.controller?.setInputSampleRate(48_000, requestGate: valid)
+    await f.drainWorker()
+    try require(
+      f.probe.snapshot.events.contains("rate-48000"), "A current authorized request reaches worker")
+
+    let expiryEntered = Mutex(false)
+    f.queue.async {
+      expiryEntered.withLock { $0 = true }
+      _ = f.probe.release.wait(timeout: .now() + 3)
+    }
+    try await eventually("Expiry blocker did not enter") { expiryEntered.withLock { $0 } }
+    f.controller?.setInputSampleRate(
+      88_200, requestGate: AudioRateRequest(expiresAt: Date().addingTimeInterval(0.03)))
+    try await Task.sleep(for: .milliseconds(80))
+    f.probe.release.signal()
+    await f.drainWorker()
+    try require(
+      !f.probe.snapshot.events.contains("rate-88200"),
+      "Queued decoder authorization expires without main-thread cancellation")
+
+    let entered = Mutex(false)
+    f.queue.async {
+      entered.withLock { $0 = true }
+      _ = f.probe.release.wait(timeout: .now() + 3)
+    }
+    try await eventually("Queue blocker did not enter") { entered.withLock { $0 } }
+    f.controller?.setInputSampleRate(44_100, requestGate: AudioRateRequest())
+    f.controller?.stop()  // Immediate run-gate close, before queued request executes.
+    f.probe.release.signal()
+    await f.drainWorker()
+    try require(
+      !f.probe.snapshot.events.contains("rate-44100"), "Stop revokes queued hardware rate changes")
+    print("PASS rate requests: worker-boundary policy revocation and immediate Stop cancellation")
   }
 
   @MainActor

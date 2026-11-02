@@ -19,6 +19,11 @@ final class StubHAL: @unchecked Sendable {
     var physicalRate = 48_000.0
     var virtualRate = 48_000.0
     var availableRates: [Double] = [44_100, 48_000, 88_200, 96_000, 176_400, 192_000]
+    /// Output-stream physical integer depth and the depths offered at every rate.
+    var physicalBits: UInt32 = 16
+    var availableBits: [UInt32] = [16, 24, 32]
+    var physicalFormatSettable = true
+    var physicalFormatWrites = 0
   }
   struct Unit {
     var device: AudioDeviceID = 0
@@ -258,6 +263,8 @@ func AudioObjectIsPropertySettable(
     settable.pointee = true
   case kAudioDevicePropertyPreferredChannelLayout:
     settable.pointee = DarwinBoolean(stubHAL.layoutSettable)
+  case kAudioStreamPropertyPhysicalFormat:
+    settable.pointee = DarwinBoolean(stubHAL.devices[id / 10]?.physicalFormatSettable ?? false)
   default:
     preconditionFailure("Unexpected settable query \(address.pointee.mSelector)")
   }
@@ -277,6 +284,21 @@ func AudioObjectSetPropertyData(
     }
     device.rate = requested
     stubHAL.devices[id] = device
+    return noErr
+  }
+  if address.pointee.mSelector == kAudioStreamPropertyPhysicalFormat {
+    guard var device = stubHAL.devices[id / 10], id % 10 == 2 else {
+      preconditionFailure("Physical format writes target output streams only")
+    }
+    let format = data.load(as: AudioStreamBasicDescription.self)
+    precondition(size == MemoryLayout<AudioStreamBasicDescription>.size)
+    precondition(format.mChannelsPerFrame == UInt32(device.outputChannels))
+    guard device.availableBits.contains(format.mBitsPerChannel),
+      format.mSampleRate == device.rate
+    else { return kAudioDeviceUnsupportedFormatError }
+    device.physicalBits = format.mBitsPerChannel
+    device.physicalFormatWrites += 1
+    stubHAL.devices[id / 10] = device
     return noErr
   }
   guard address.pointee.mSelector == kAudioDevicePropertyPreferredChannelLayout else {
@@ -317,6 +339,10 @@ func AudioObjectGetPropertyDataSize(
     size.pointee = UInt32(
       (stubHAL.devices[id]?.availableRates.count ?? 0) * MemoryLayout<AudioValueRange>.size)
   case kAudioDevicePropertyStreams: size.pointee = 4
+  case kAudioStreamPropertyAvailablePhysicalFormats:
+    let device = stubHAL.devices[id / 10]!
+    let count = id % 10 == 2 ? device.availableBits.count : 0
+    size.pointee = UInt32(count * MemoryLayout<AudioStreamRangedDescription>.size)
   default: preconditionFailure("Unexpected size query \(address.pointee.mSelector)")
   }
   return noErr
@@ -353,7 +379,25 @@ func AudioObjectGetPropertyData(
       selector == kAudioStreamPropertyVirtualFormat
       ? device.virtualRate : device.physicalRate
     format.mChannelsPerFrame = UInt32(id % 10 == 1 ? device.inputChannels : device.outputChannels)
+    if id % 10 == 2 && selector == kAudioStreamPropertyPhysicalFormat {
+      format = stubIntegerFormat(
+        rate: device.physicalRate, channels: format.mChannelsPerFrame, bits: device.physicalBits)
+    }
     data.storeBytes(of: format, as: AudioStreamBasicDescription.self)
+    return noErr
+  }
+  if selector == kAudioStreamPropertyAvailablePhysicalFormats {
+    let device = stubHAL.devices[id / 10]!
+    for (index, bits) in device.availableBits.enumerated() {
+      // Ranged entries (rate 0) valid for every rate the device offers.
+      let ranged = AudioStreamRangedDescription(
+        mFormat: stubIntegerFormat(rate: 0, channels: UInt32(device.outputChannels), bits: bits),
+        mSampleRateRange: AudioValueRange(
+          mMinimum: device.availableRates.min() ?? 0, mMaximum: device.availableRates.max() ?? 0))
+      data.storeBytes(
+        of: ranged, toByteOffset: index * MemoryLayout<AudioStreamRangedDescription>.size,
+        as: AudioStreamRangedDescription.self)
+    }
     return noErr
   }
   guard let device = stubHAL.devices[id] else { return kAudioHardwareBadObjectError }
@@ -412,4 +456,14 @@ func AudioObjectGetPropertyData(
   default: preconditionFailure("Unexpected device query \(selector)")
   }
   return noErr
+}
+
+func stubIntegerFormat(rate: Double, channels: UInt32, bits: UInt32) -> AudioStreamBasicDescription
+{
+  let bytes = bits / 8
+  return AudioStreamBasicDescription(
+    mSampleRate: rate, mFormatID: kAudioFormatLinearPCM,
+    mFormatFlags: kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
+    mBytesPerPacket: bytes * channels, mFramesPerPacket: 1, mBytesPerFrame: bytes * channels,
+    mChannelsPerFrame: channels, mBitsPerChannel: bits, mReserved: 0)
 }

@@ -16,5 +16,7 @@ extension AudioEngine {
   var checkInputChannels: Int { inputChannels }
   var checkHasRateConverter: Bool { inputRateConverter != nil }
 
-  func checkRequestInputRate(_ rate: Double) { requestInputSampleRate(rate) }
+  func checkRequestInputRate(_ rate: Double, requestGate: AudioRateRequest? = nil) {
+    requestInputSampleRate(rate, requestGate: requestGate)
+  }
 }

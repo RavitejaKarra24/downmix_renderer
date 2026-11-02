@@ -4,8 +4,10 @@ import Foundation
 /// One reading from Music.app.
 enum MusicRateObservation: Equatable, Sendable {
   case playing(rate: Double, track: String)
-  /// Paused, stopped, no track loaded, or a track without a usable rate.
+  /// A confirmed paused/stopped player; a real playback-episode boundary.
   case idle
+  /// The player may still be playing, but source metadata is missing/unusable.
+  case metadataUnavailable
   case failure(MusicRateFailure)
 
   var rate: Double? {
@@ -166,13 +168,14 @@ final class MusicTrackRateMonitor: MusicRateMonitoring, @unchecked Sendable {
 
   /// `"96000|Track name"`, `"paused"` or `"no track"`. Exposed for deterministic checks.
   static func parse(_ output: String?) -> MusicRateObservation {
-    guard let output else { return .idle }
+    guard let output else { return .metadataUnavailable }
     let text = output.trimmingCharacters(in: .whitespacesAndNewlines)
-    if text.isEmpty || text == "paused" || text.hasPrefix("no track") { return .idle }
+    if text == "paused" { return .idle }
+    if text.isEmpty || text.hasPrefix("no track") { return .metadataUnavailable }
     let parts = text.split(separator: "|", maxSplits: 1, omittingEmptySubsequences: false)
     guard let rate = Double(String(parts[0]).trimmingCharacters(in: .whitespaces)),
       rate.isFinite, rate > 0
-    else { return .idle }
+    else { return .metadataUnavailable }
     let track = parts.count > 1 ? String(parts[1]) : ""
     return .playing(rate: rate, track: track)
   }

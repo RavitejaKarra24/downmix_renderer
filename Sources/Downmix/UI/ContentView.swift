@@ -143,6 +143,15 @@ struct ContentView: View {
             onSelect: state.selectOutput
           )
 
+          VStack(alignment: .leading, spacing: 14) {
+            Label("Signal path", systemImage: "waveform.path")
+              .font(DownmixTheme.TypeScale.headline)
+              .foregroundStyle(DownmixTheme.textPrimary)
+            RateSignalPathView()
+          }
+          .padding(15)
+          .downmixRaisedPanel()
+
           controlsCard
         }
         .padding(.bottom, 2)

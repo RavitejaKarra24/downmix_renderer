@@ -1,5 +1,39 @@
 import Foundation
 
+enum SampleRateMode: String, Codable, CaseIterable, Identifiable, Sendable {
+  case automatic
+  case followInput
+  case fixed
+
+  var id: Self { self }
+
+  var title: String {
+    switch self {
+    case .automatic: "Automatic"
+    case .followInput: "Follow input"
+    case .fixed: "Fixed"
+    }
+  }
+}
+
+/// How the DAC's bit depth is chosen at each output rate.
+enum OutputBitDepthMode: String, Codable, CaseIterable, Identifiable, Sendable {
+  /// The source's own bit depth when known (open file header or decoder record),
+  /// the nearest deeper one if the DAC lacks it, and the deepest for unknown sources.
+  case matchSource
+  /// Always the deepest the DAC offers; never truncates the float mix.
+  case deepest
+
+  var id: Self { self }
+
+  var title: String {
+    switch self {
+    case .matchSource: "Match source"
+    case .deepest: "Deepest available"
+    }
+  }
+}
+
 struct AppPreferences: Codable, Equatable, Sendable {
   var inputDeviceUID: String = ""
   var outputDeviceUID: String = ""
@@ -14,9 +48,19 @@ struct AppPreferences: Codable, Equatable, Sendable {
   var lfeLowpass: Bool = true
   var swapOutputs: Bool = false
   var autoStart: Bool = false
-  /// Match the input device's nominal rate to the current Music.app track. Off means the
-  /// device keeps whatever rate the user set in Audio MIDI Setup.
+  /// Allow the Music metadata adapter to inspect track rates. This does not select a rate mode.
   var matchMusicSampleRate: Bool = true
+  var sampleRateMode: SampleRateMode = .automatic
+  var fixedSampleRate: Double = 48000
+  /// Explicit per-app rate declarations, keyed by bundle identifier or app name.
+  /// These are user statements, not heuristics, and rank below decoder evidence.
+  var appRateProfiles: [String: Double] = [:]
+  var outputBitDepthMode: OutputBitDepthMode = .matchSource
+
+  static let selectableSampleRates: [Double] = [
+    8000, 16000, 44100, 48000, 88200, 96000, 176400, 192000,
+    352800, 384000, 705600, 768000,
+  ]
 
   static let storageURL: URL = {
     let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
@@ -46,6 +90,13 @@ struct AppPreferences: Codable, Equatable, Sendable {
     result.framesPerBuffer = ((clampedFrames + 16) / 32) * 32
     result.preampDb = preampDb.isFinite ? min(6, max(-30, preampDb)) : AppPreferences().preampDb
     result.layoutPresetName = LayoutPreset.named(layoutPresetName).name
+    result.fixedSampleRate =
+      fixedSampleRate.isFinite && Self.selectableSampleRates.contains(fixedSampleRate)
+      ? fixedSampleRate : AppPreferences().fixedSampleRate
+    result.appRateProfiles = appRateProfiles.filter { key, rate in
+      !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && key.count <= 256
+        && rate.isFinite && Self.selectableSampleRates.contains(rate)
+    }
     return result
   }
 }
@@ -56,6 +107,7 @@ extension AppPreferences {
     case inputDeviceUID, outputDeviceUID, inputDeviceName, outputDeviceName
     case layoutPresetName, framesPerBuffer, preampDb, inputLatencyMs, outputLatencyMs
     case keepOutputAlive, lfeLowpass, swapOutputs, autoStart, matchMusicSampleRate
+    case sampleRateMode, fixedSampleRate, appRateProfiles, outputBitDepthMode
   }
 
   init(from decoder: Decoder) throws {
@@ -88,6 +140,18 @@ extension AppPreferences {
     matchMusicSampleRate =
       try container.decodeIfPresent(Bool.self, forKey: .matchMusicSampleRate)
       ?? matchMusicSampleRate
+    // Legacy opt-out meant keeping the input's rate, not disabling universal playback.
+    sampleRateMode =
+      try container.decodeIfPresent(SampleRateMode.self, forKey: .sampleRateMode)
+      ?? (matchMusicSampleRate ? .automatic : .followInput)
+    fixedSampleRate =
+      try container.decodeIfPresent(Double.self, forKey: .fixedSampleRate) ?? fixedSampleRate
+    appRateProfiles =
+      try container.decodeIfPresent([String: Double].self, forKey: .appRateProfiles)
+      ?? appRateProfiles
+    outputBitDepthMode =
+      try container.decodeIfPresent(OutputBitDepthMode.self, forKey: .outputBitDepthMode)
+      ?? outputBitDepthMode
     self = normalized()
   }
 
@@ -108,5 +172,9 @@ extension AppPreferences {
     try container.encode(preferences.swapOutputs, forKey: .swapOutputs)
     try container.encode(preferences.autoStart, forKey: .autoStart)
     try container.encode(preferences.matchMusicSampleRate, forKey: .matchMusicSampleRate)
+    try container.encode(preferences.sampleRateMode, forKey: .sampleRateMode)
+    try container.encode(preferences.fixedSampleRate, forKey: .fixedSampleRate)
+    try container.encode(preferences.appRateProfiles, forKey: .appRateProfiles)
+    try container.encode(preferences.outputBitDepthMode, forKey: .outputBitDepthMode)
   }
 }

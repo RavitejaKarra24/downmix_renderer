@@ -25,6 +25,9 @@ Scripts/check_preferences.sh
 Scripts/check_realtime.sh
 Scripts/check_audio_transport.sh
 Scripts/check_hal.sh
+Scripts/check_sources.sh
+Scripts/check_decoders.sh
+Scripts/check_source_files.sh
 Scripts/check_clock_drift.sh
 Scripts/check_lifecycle.sh
 Scripts/check_async_control.sh
