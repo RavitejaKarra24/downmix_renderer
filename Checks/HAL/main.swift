@@ -122,24 +122,8 @@ func unsafeStartChecks() {
 
 func watchdogChecks() throws {
   let cases: [(String, () -> Void)] = [
-    ("input channels", { stubHAL.devices[101]!.inputChannels = 8 }),
+    ("input below two channels", { stubHAL.devices[101]!.inputChannels = 1 }),
     ("output channels", { stubHAL.devices[201]!.outputChannels = 1 }),
-    ("input nominal rate", { stubHAL.devices[101]!.rate = 44_100 }),
-    ("output nominal rate", { stubHAL.devices[201]!.rate = 96_000 }),
-    (
-      "input unit device rate",
-      {
-        let unit = stubHAL.units.first { $0.value.isInput }!.key
-        stubHAL.units[unit]!.hardwareRate = 44_100
-      }
-    ),
-    (
-      "output unit device rate",
-      {
-        let unit = stubHAL.units.first { !$0.value.isInput }!.key
-        stubHAL.units[unit]!.hardwareRate = 44_100
-      }
-    ),
     (
       "input client channels",
       {
@@ -161,8 +145,8 @@ func watchdogChecks() throws {
         stubHAL.units[unit]!.client.mFormatFlags |= kAudioFormatFlagIsNonInterleaved
       }
     ),
-    ("input physical stream rate", { stubHAL.devices[101]!.physicalRate = 44_100 }),
-    ("output virtual stream rate", { stubHAL.devices[201]!.virtualRate = 44_100 }),
+    ("input physical stream rate", { stubHAL.devices[101]!.physicalRate = 0 }),
+    ("output virtual stream rate", { stubHAL.devices[201]!.virtualRate = .nan }),
     ("output disconnect", { stubHAL.devices[201]!.alive = 0 }),
     (
       "selected unit device",
@@ -197,10 +181,15 @@ func watchdogChecks() throws {
   stubHAL.reset()
   stubHAL.devices[101]!.inputChannels = 32
   let wider = try startEngine(channels: 32)
+  require(
+    wider.checkInputChannels == InputChannelLayout.channelCount,
+    "A wider device is read through the 16 bed slots only")
   stubHAL.devices[101]!.inputChannels = 16
   wider.checkWatchdogTick()
   require(
-    wider.currentStatus.phase == .error, "Topology checked against negotiated 32, not fixed 16")
+    wider.currentStatus.phase == .running,
+    "Narrowing back to the bed width needs no restart")
+  wider.stop()
   stubHAL.reset()
   let compatible = try startEngine()
   stubHAL.devices[101]!.inputChannels = 32
@@ -394,6 +383,133 @@ func bedLayoutChecks() throws {
   print("PASS: actual-engine bed layout install, idempotence, width and refusal reporting")
 }
 
+/// The reported bug: Apple Music (through a sample-rate switcher) moves the input
+/// device between 44.1, 48 and 96 kHz, and players pick their own content width.
+/// Neither may stop the renderer any more.
+func deviceRateAndWidthChecks() throws {
+  stubHAL.reset()
+  stubHAL.devices[101]!.rate = 44_100
+  let engine = try startEngine()
+  require(engine.checkInputRate == 44_100, "Input follows the device rate")
+  require(engine.checkHasRateConverter, "Non-48 kHz input is converted internally")
+  require(engine.currentStatus.inputSampleRate == 44_100, "Status reports the live input rate")
+  require(
+    engine.currentStatus.message.contains("44.1 kHz → 48 kHz"),
+    "Status names the converted rate: \(engine.currentStatus.message)")
+  require(
+    engine.currentStatus.bedLayoutInstalled == true,
+    "Bed layout still installs at the device's own rate")
+  var inputUnit = stubHAL.units.values.first { $0.isInput }!
+  require(inputUnit.client.mSampleRate == 44_100, "Input unit opens at the device rate")
+  require(inputUnit.client.mChannelsPerFrame == 16, "Input unit opens the full bed width")
+
+  // Feed a known per-channel signal; the meters prove the converted path reaches the DSP.
+  stubHAL.inputValues = (0..<16).map { 0.1 / Float($0 + 1) }
+  for _ in 0..<12 { require(stubHAL.inputCallback(frames: 512) == noErr, "44100 input renders") }
+  engine.checkWatchdogTick()
+  require(
+    abs(engine.currentStatus.meters.inputPeaksDb[0] - 20 * log10(0.1)) < 1,
+    "Resampled input reaches the bed meters")
+
+  // Live rate change, as a sample-rate switcher does at a track boundary.
+  // A rate change can fail a render before the next watchdog tick. The reopen must make
+  // that specific format error stale instead of stopping a healthy run.
+  stubHAL.devices[101]!.rate = 96_000
+  require(
+    stubHAL.inputCallback(frames: 512) == kAudioUnitErr_CannotDoInCurrentContext,
+    "A stale client rate fails the render like real AUHAL")
+  engine.checkWatchdogTick()
+  require(engine.currentStatus.phase == .running, "Live rate change keeps rendering")
+  require(
+    engine.currentStatus.diagnostics.renderErrorCount == 1,
+    "The transient render error is counted but does not stop the run")
+  require(engine.checkInputRate == 96_000, "Engine follows the new rate")
+  require(engine.checkHasRateConverter, "96 kHz still converts")
+  require(engine.currentStatus.inputSampleRate == 96_000, "Status follows the new rate")
+  inputUnit = stubHAL.units.values.first { $0.isInput }!
+  require(inputUnit.client.mSampleRate == 96_000, "Input unit reopens at 96 kHz")
+  require(stubHAL.disposalCount == 0, "Only the input unit is reopened, never disposed")
+  require(
+    stubHAL.units.values.first { !$0.isInput }!.started,
+    "Output unit keeps running across the input reopen")
+  for _ in 0..<24 { require(stubHAL.inputCallback(frames: 512) == noErr, "96000 input renders") }
+  engine.checkWatchdogTick()
+  require(
+    abs(engine.currentStatus.meters.inputPeaksDb[0] - 20 * log10(0.1)) < 1,
+    "Audio still reaches the meters after the rate change")
+
+  stubHAL.devices[101]!.rate = 48_000
+  engine.checkWatchdogTick()
+  require(
+    engine.currentStatus.phase == .running && !engine.checkHasRateConverter,
+    "Back at 48 kHz the converter is dropped")
+
+  // A narrower input keeps rendering the slots it has instead of stopping.
+  stubHAL.devices[101]!.inputChannels = 8
+  engine.checkWatchdogTick()
+  require(
+    engine.currentStatus.phase == .running && engine.checkInputChannels == 8,
+    "Narrower input reopens at its own width")
+  require(
+    stubHAL.units.values.first { $0.isInput }!.client.mChannelsPerFrame == 8,
+    "Input client width follows the device")
+  require(engine.currentStatus.inputChannelCount == 8, "Status reports the live width")
+  for _ in 0..<12 { require(stubHAL.inputCallback(frames: 512) == noErr, "8ch input renders") }
+  engine.checkWatchdogTick()
+  require(
+    abs(engine.currentStatus.meters.inputPeaksDb[5] - 20 * log10(0.1 / 6)) < 1,
+    "Remaining bed slots still meter")
+
+  stubHAL.devices[101]!.inputChannels = 32
+  engine.checkWatchdogTick()
+  require(
+    engine.currentStatus.phase == .running && engine.checkInputChannels == 16,
+    "Wider input clamps to the 16 bed slots")
+
+  stubHAL.devices[101]!.inputChannels = 1
+  engine.checkWatchdogTick()
+  require(engine.currentStatus.phase == .error, "One input channel stops with a clear message")
+  require(engine.currentStatus.message.contains("at least two"), "Message names the minimum")
+  require(stubHAL.units.isEmpty && stubHAL.disposalCount == 2, "Both units disposed on failure")
+
+  stubHAL.reset()
+  stubHAL.devices[101]!.rate = 1_000
+  let unsupported = AudioEngine(queue: checkQueue)
+  do {
+    try unsupported.start(
+      inputDeviceID: 101, outputDeviceID: 201, configuration: .init(), framesPerBuffer: 128)
+    preconditionFailure("An out-of-range input rate must be refused")
+  } catch {
+    require(
+      unsupported.currentStatus.message.contains("8–768 kHz"),
+      "Refusal names the supported band")
+    require(stubHAL.units.isEmpty, "Refused rates create no unit")
+  }
+
+  // The output device may also run at another rate; AUHAL converts the stereo client.
+  stubHAL.reset()
+  stubHAL.devices[201]!.rate = 44_100
+  let convertedOutput = try startEngine()
+  require(
+    convertedOutput.currentStatus.phase == .running
+      && stubHAL.units.values.first { !$0.isInput }!.client.mSampleRate == 48_000,
+    "Output keeps a 48 kHz client while the device runs at another rate")
+  stubHAL.devices[201]!.rate = 96_000
+  convertedOutput.checkWatchdogTick()
+  require(
+    convertedOutput.currentStatus.phase == .running,
+    "A live output rate change is not a failure")
+  convertedOutput.stop()
+  require(convertedOutput.currentStatus.inputSampleRate == nil, "Stopped status clears the rate")
+
+  stubHAL.reset()
+  stubHAL.devices[201]!.rate = 44_100
+  let keepAlive = try startEngine(keepAlive: true)
+  require(keepAlive.currentStatus.phase == .keepAlive, "Keep-alive accepts any output rate")
+  keepAlive.stop()
+  print("PASS: actual-engine live input rate/width reopen, clamping and output rate changes")
+}
+
 checkQueue.async {
   do {
     routeChecks()
@@ -401,6 +517,7 @@ checkQueue.async {
     try watchdogChecks()
     try nilOutputChecks()
     try bedLayoutChecks()
+    try deviceRateAndWidthChecks()
     try cleanupChecks()
     print("All isolated HAL checks passed (no hardware or system routes touched)")
     exit(0)

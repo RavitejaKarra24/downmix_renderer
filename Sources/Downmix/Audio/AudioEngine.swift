@@ -21,6 +21,9 @@ struct EngineStatus: Sendable, Equatable {
   /// Bed layout advertisement for the input device of this run: `nil` when the run has
   /// no 16-channel input, `false` when the HAL refused the layout change.
   var bedLayoutInstalled: Bool?
+  /// Live input format of this run. `nil` while stopped, erroring or keep-alive only.
+  var inputSampleRate: Double?
+  var inputChannelCount: Int?
 }
 
 /// Dual-device Core Audio engine: multi-channel input → DSP → stereo output.
@@ -58,7 +61,15 @@ final class AudioEngine: @unchecked Sendable {
   private var outputUnit: AudioComponentInstance?
   private var ring: FloatRingBuffer?
   private var processor = DownmixProcessor()
+  private var configuration = DownmixProcessor.Configuration()
   private var inputChannels = 16
+  /// Client format rate of the input unit. The HAL cannot convert virtual-device
+  /// input rates, so the input follows the device and `inputRateConverter` produces
+  /// the fixed 48 kHz DSP rate.
+  private var inputDeviceRate = AudioEngine.targetSampleRate
+  private var inputRateConverter: InputRateConverter?
+  private var convertedInput = [Float]()
+  private var maximumConvertedFrames = 0
   private var framesPerBuffer: UInt32 = 128
   private var expectedInputDeviceID = AudioDeviceID(kAudioObjectUnknown)
   private var expectedOutputDeviceID = AudioDeviceID(kAudioObjectUnknown)
@@ -123,16 +134,24 @@ final class AudioEngine: @unchecked Sendable {
       _ = meterMailbox.consumeLatest()
       self.framesPerBuffer = UInt32(min(1024, max(32, framesPerBuffer)))
       self.keepAliveOnly = keepAliveOnly
-      self.inputChannels = max(configuration.inputChannelCount, 16)
-      try validateDevices(inputDeviceID: inputDeviceID, outputDeviceID: outputDeviceID)
+      let inputFormat = try validateDevices(
+        inputDeviceID: inputDeviceID, outputDeviceID: outputDeviceID)
+      // The device, not the cached catalog, owns the live width and rate. Players and
+      // sample-rate switchers can change them between catalog refreshes.
+      self.inputChannels = inputFormat.channels
+      self.inputDeviceRate = inputFormat.rate
+      self.configuration = configuration
+      self.configuration.inputChannelCount = inputFormat.channels
       // Players downmix to stereo unless the input device advertises a layout their
       // channel map can convert. Install it before IO opens so the next client stream
       // negotiates the full bed. A refused layout is reported, never fatal.
+      // A 16-channel bed only: a wider device keeps its own layout, and a narrower one
+      // cannot describe the bed.
       status.bedLayoutInstalled =
         keepAliveOnly
         ? nil
         : InputChannelLayout.installIfNeeded(
-          deviceID: inputDeviceID, channelCount: inputChannels)
+          deviceID: inputDeviceID, channelCount: inputFormat.deviceChannels)
       if status.bedLayoutInstalled == false {
         logger.warning("Input device refused the 9.1.6 bed layout; players may send stereo")
       }
@@ -140,7 +159,7 @@ final class AudioEngine: @unchecked Sendable {
       // Do not retain a copied processor at startup: its delay arrays must be uniquely
       // owned before callbacks begin, otherwise the first write could trigger COW allocation.
       processor = DownmixProcessor()
-      processor.apply(configuration: configuration)
+      processor.apply(configuration: self.configuration)
 
       if !keepAliveOnly {
         let unit = try makeHALUnit()
@@ -153,8 +172,7 @@ final class AudioEngine: @unchecked Sendable {
           throw EngineError.setupFailed("Input slice exceeds the audio buffer byte limit")
         }
         // Allocate all callback scratch storage before either unit can start callbacks.
-        inputData = [Float](repeating: 0, count: Int(maximumInputFrames) * inputChannels)
-        scratchStereo = [Float](repeating: 0, count: Int(maximumInputFrames) * 2)
+        try allocateInputBuffers()
       }
 
       let unit = try makeHALUnit()
@@ -168,9 +186,13 @@ final class AudioEngine: @unchecked Sendable {
         throw EngineError.setupFailed(
           "Audio unit maximum slice is smaller than the device I/O buffer")
       }
+      // Queue geometry follows the 48 kHz frames a callback produces, not the
+      // device-rate frames the input unit receives.
       let buffering = StereoOutputBuffering(
-        inputFrames: negotiatedInputFrames, outputFrames: negotiatedOutputFrames,
-        maximumInputFrames: Int(maximumInputFrames), maximumOutputFrames: Int(maximumOutputFrames)
+        inputFrames: converterFrames(forDeviceFrames: negotiatedInputFrames),
+        outputFrames: negotiatedOutputFrames,
+        maximumInputFrames: maximumConvertedFrames,
+        maximumOutputFrames: Int(maximumOutputFrames)
       )
       ring = keepAliveOnly ? nil : FloatRingBuffer(capacity: buffering.ringCapacityFrames * 2)
       outputRenderer = StereoOutputRenderer(
@@ -194,7 +216,8 @@ final class AudioEngine: @unchecked Sendable {
 
       publish(
         phase: keepAliveOnly ? .keepAlive : .running,
-        message: keepAliveOnly ? "Output keep-alive running" : "Stereo renderer running"
+        message: keepAliveOnly
+          ? "Output keep-alive running" : Self.runningMessage(inputRate: inputDeviceRate)
       )
       startMeterTimer()
     } catch {
@@ -212,6 +235,11 @@ final class AudioEngine: @unchecked Sendable {
     dispatchPrecondition(condition: .onQueue(queue))
     // Array-to-POD conversion and sanitization happen on the worker queue.
     // The callback applies the newest complete value at its next block boundary.
+    var configuration = configuration
+    // The device owns the live input width; a cached catalog value must not make the
+    // processor read past the frames its callback actually rendered.
+    if !keepAliveOnly { configuration.inputChannelCount = inputChannels }
+    self.configuration = configuration
     configurationMailbox.publish(DownmixProcessor.RealtimeConfiguration(configuration))
   }
 
@@ -298,7 +326,7 @@ final class AudioEngine: @unchecked Sendable {
       "set input device"
     )
 
-    var asbd = streamFormat(channels: UInt32(inputChannels))
+    var asbd = streamFormat(channels: UInt32(inputChannels), sampleRate: inputDeviceRate)
     try check(
       AudioUnitSetProperty(
         unit,
@@ -482,13 +510,31 @@ final class AudioEngine: @unchecked Sendable {
     return frames
   }
 
-  private func validateDevices(inputDeviceID: AudioDeviceID, outputDeviceID: AudioDeviceID) throws {
+  /// Validates the route and returns the live input format. Device rates are not
+  /// constrained to 48 kHz: the input follows the device and is converted internally,
+  /// and AUHAL converts the stereo client format for the output device.
+  private struct LiveInputFormat {
+    /// Client width: at most the 16 bed slots the processor maps.
+    let channels: Int
+    /// Width the device itself exposes, which decides the installed bed layout.
+    let deviceChannels: Int
+    let rate: Double
+  }
+
+  private func validateDevices(inputDeviceID: AudioDeviceID, outputDeviceID: AudioDeviceID) throws
+    -> LiveInputFormat
+  {
     let devices = DeviceManager.allDevices()
     guard let output = devices.first(where: { $0.id == outputDeviceID }) else {
       throw EngineError.missingDevice
     }
-    guard output.outputChannelCount >= 2, output.nominalSampleRate == Self.targetSampleRate else {
-      throw EngineError.setupFailed("Output must expose at least two channels at 48 kHz")
+    guard output.outputChannelCount >= 2 else {
+      throw EngineError.setupFailed(
+        "\(output.name) exposes \(output.outputChannelCount) output channel(s); a stereo output needs two."
+      )
+    }
+    guard output.nominalSampleRate.isFinite, output.nominalSampleRate > 0 else {
+      throw EngineError.setupFailed("\(output.name) reports no usable sample rate.")
     }
     let inputUID = devices.first(where: { $0.id == inputDeviceID })?.uid ?? ""
     guard DeviceManager.isSafeOutputRoute(output, inputUID: keepAliveOnly ? "" : inputUID) else {
@@ -496,22 +542,39 @@ final class AudioEngine: @unchecked Sendable {
     }
     expectedOutputInfo = output
     expectedInputUID = keepAliveOnly ? "" : inputUID
-    if !keepAliveOnly {
-      guard let input = devices.first(where: { $0.id == inputDeviceID }) else {
-        throw EngineError.missingDevice
-      }
-      guard input.inputChannelCount >= inputChannels,
-        input.nominalSampleRate == Self.targetSampleRate
-      else {
-        throw EngineError.setupFailed(
-          "Input must expose at least \(inputChannels) channels at 48 kHz")
-      }
+    guard !keepAliveOnly else {
+      return LiveInputFormat(
+        channels: inputChannels, deviceChannels: inputChannels, rate: Self.targetSampleRate)
     }
+
+    guard let input = devices.first(where: { $0.id == inputDeviceID }) else {
+      throw EngineError.missingDevice
+    }
+    // Query the HAL instead of the cached catalog: the width and rate can change
+    // between a catalog refresh and Start.
+    guard let live = DeviceManager.inputFormat(id: inputDeviceID) else {
+      throw EngineError.setupFailed("Could not read the format of \(input.name).")
+    }
+    guard live.channels >= 2 else {
+      throw EngineError.setupFailed(
+        "\(input.name) exposes \(live.channels) input channel(s); Downmix needs at least two."
+      )
+    }
+    guard live.rate.isFinite, InputRateConverter.supportedDeviceRates.contains(live.rate) else {
+      throw EngineError.setupFailed(
+        "\(input.name) reports \(Self.rateLabel(live.rate)); Downmix supports 8–768 kHz input."
+      )
+    }
+    return LiveInputFormat(
+      channels: min(InputChannelLayout.channelCount, live.channels),
+      deviceChannels: live.channels, rate: live.rate)
   }
 
-  private func streamFormat(channels: UInt32) -> AudioStreamBasicDescription {
+  private func streamFormat(channels: UInt32, sampleRate: Double = AudioEngine.targetSampleRate)
+    -> AudioStreamBasicDescription
+  {
     AudioStreamBasicDescription(
-      mSampleRate: Self.targetSampleRate,
+      mSampleRate: sampleRate,
       mFormatID: kAudioFormatLinearPCM,
       mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked
         | kAudioFormatFlagsNativeEndian,
@@ -522,6 +585,107 @@ final class AudioEngine: @unchecked Sendable {
       mBitsPerChannel: 32,
       mReserved: 0
     )
+  }
+
+  /// Storage for the widest block the input unit can hand us. Always the full bed width
+  /// so a live width change can never read past the rendered frames before the
+  /// processor applies its new channel count.
+  private func allocateInputScratch() {
+    inputData = [Float](
+      repeating: 0, count: Int(maximumInputFrames) * InputChannelLayout.channelCount)
+    inputRateConverter = InputRateConverter(
+      deviceRate: inputDeviceRate, channelCount: inputChannels)
+    inputRateConverter?.prime()
+  }
+
+  /// Allocates the device-rate and 48 kHz scratch storage for the current input format.
+  /// Queue geometry rejects a device buffer/rate combination larger than one supported
+  /// slice instead of trapping in `StereoOutputBuffering`.
+  private func allocateInputBuffers() throws {
+    allocateInputScratch()
+    if let converter = inputRateConverter {
+      maximumConvertedFrames = converter.outputCapacity(forInputFrames: Int(maximumInputFrames))
+      guard maximumConvertedFrames <= StereoOutputBuffering.maximumSliceFrames else {
+        throw EngineError.setupFailed(
+          "The input rate and buffer size need more than \(maximumConvertedFrames) frames per slice"
+        )
+      }
+      convertedInput = [Float](repeating: 0, count: maximumConvertedFrames * inputChannels)
+      scratchStereo = [Float](repeating: 0, count: maximumConvertedFrames * 2)
+    } else {
+      maximumConvertedFrames = Int(maximumInputFrames)
+      convertedInput = []
+      scratchStereo = [Float](repeating: 0, count: Int(maximumInputFrames) * 2)
+    }
+  }
+
+  /// 48 kHz frames produced for one device-rate callback.
+  private func converterFrames(forDeviceFrames frames: Int) -> Int {
+    inputRateConverter?.convertedFrames(forInputFrames: frames) ?? frames
+  }
+
+  /// Reopens only the input unit when a player or sample-rate switcher changes the
+  /// input device's rate or width. The output unit and its queue keep running, so a
+  /// rate switch no longer stops the renderer.
+  private func reconfigureInputIfNeeded() throws {
+    guard !keepAliveOnly, let unit = inputUnit else { return }
+    guard let live = DeviceManager.inputFormat(id: expectedInputDeviceID) else {
+      throw EngineError.setupFailed("The selected input device is unavailable")
+    }
+    let channels = min(InputChannelLayout.channelCount, live.channels)
+    guard channels >= 2 else {
+      throw EngineError.setupFailed(
+        "The selected input now exposes \(live.channels) channel(s). Downmix needs at least two."
+      )
+    }
+    guard InputRateConverter.supportedDeviceRates.contains(live.rate) else {
+      throw EngineError.setupFailed(
+        "The selected input changed to \(Self.rateLabel(live.rate)), which Downmix does not support."
+      )
+    }
+    guard channels != inputChannels || live.rate != inputDeviceRate else { return }
+
+    logger.notice(
+      "Input format changed to \(live.rate) Hz / \(channels) ch; reopening the input unit")
+    _ = AudioOutputUnitStop(unit)
+    _ = AudioUnitUninitialize(unit)
+
+    inputChannels = channels
+    inputDeviceRate = live.rate
+    configuration.inputChannelCount = channels
+
+    var asbd = streamFormat(channels: UInt32(channels), sampleRate: live.rate)
+    try check(
+      AudioUnitSetProperty(
+        unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 1, &asbd,
+        UInt32(MemoryLayout<AudioStreamBasicDescription>.size)),
+      "update input unit client format")
+    try setMaximumFramesPerSlice(unit, deviceID: expectedInputDeviceID)
+    maximumInputFrames = try maximumFramesPerSlice(unit)
+    try allocateInputBuffers()
+    // Consumed by the first callback after the restart, before it processes samples.
+    configurationMailbox.publish(DownmixProcessor.RealtimeConfiguration(configuration))
+    try check(AudioUnitInitialize(unit), "reinitialize input unit")
+    try check(AudioOutputUnitStart(unit), "restart audio unit")
+    // Between the device's rate change and this reopen the old client format can fail
+    // renders with "cannot do in current context". That error is stale now; genuine
+    // render failures are still reported.
+    audioDiagnostics.clearStaleFormatFailure(kAudioUnitErr_CannotDoInCurrentContext)
+    logger.notice("Input unit reopened at \(live.rate) Hz / \(channels) ch")
+  }
+
+  private static func rateLabel(_ rate: Double) -> String {
+    guard rate.isFinite else { return "an unknown rate" }
+    let kiloHertz = rate / 1_000
+    let text =
+      kiloHertz == kiloHertz.rounded()
+      ? String(Int(kiloHertz)) : String(format: "%.1f", kiloHertz)
+    return "\(text) kHz"
+  }
+
+  private static func runningMessage(inputRate: Double) -> String {
+    guard inputRate != targetSampleRate else { return "Stereo renderer running" }
+    return "Stereo renderer running · \(rateLabel(inputRate)) → 48 kHz"
   }
 
   private func startUnit(_ unit: AudioComponentInstance) throws {
@@ -573,11 +737,16 @@ final class AudioEngine: @unchecked Sendable {
     expectedInputUID = ""
     maximumInputFrames = 0
     maximumOutputFrames = 0
+    maximumConvertedFrames = 0
     outputRenderer = nil
     ring?.clear()
     ring = nil
     inputData = []
     scratchStereo = []
+    convertedInput = []
+    inputRateConverter = nil
+    inputChannels = InputChannelLayout.channelCount
+    inputDeviceRate = Self.targetSampleRate
 
     if inUnit != nil || outUnit != nil {
       logger.info("Audio units stopped and disposed")
@@ -653,21 +822,34 @@ final class AudioEngine: @unchecked Sendable {
       AudioObjectGetPropertyData(deviceID, &rateAddress, 0, nil, &rateSize, &rate),
       "verify \(label) sample rate"
     )
-    guard rate == Self.targetSampleRate else {
+    // Any real device rate is usable: the input is converted to 48 kHz and AUHAL
+    // converts the stereo client format for the output device. Only a device that
+    // reports no usable rate is a failure.
+    guard rate.isFinite, rate > 0 else {
       throw EngineError.setupFailed(
-        "The selected \(label) is no longer at 48 kHz. Downmix stopped safely.")
+        "The selected \(label) reports no usable sample rate. Downmix stopped safely.")
     }
 
     let deviceScope = isInput ? kAudioDevicePropertyScopeInput : kAudioDevicePropertyScopeOutput
-    let requiredChannels = isInput ? inputChannels : 2
-    guard DeviceManager.channelCount(id: deviceID, scope: deviceScope) >= requiredChannels else {
-      throw EngineError.setupFailed(
-        "The selected \(label) channel topology changed; requires at least \(requiredChannels) channels. Downmix stopped safely."
-      )
+    // An input width change is a reconfiguration, not a failure; the reopen validates the
+    // new width. The output has no such path, so its topology must stay usable.
+    if isInput {
+      guard DeviceManager.channelCount(id: deviceID, scope: deviceScope) >= 1 else {
+        throw EngineError.setupFailed("The selected input no longer exposes any channels.")
+      }
+    } else {
+      guard DeviceManager.channelCount(id: deviceID, scope: deviceScope) >= 2 else {
+        throw EngineError.setupFailed(
+          "The selected output channel topology changed; requires at least two channels. Downmix stopped safely."
+        )
+      }
     }
 
-    // Nominal rate alone does not certify the formats actually used by HAL.
-    // Check the device-side unit format AND the exact callback/client memory layout.
+    // The live device rate and width are allowed to change; `reconfigureInputIfNeeded`
+    // reopens the input instead of treating a player's rate switch as a failure. The
+    // client format must still be the one this run installed.
+    let expectedRate = isInput ? inputDeviceRate : Self.targetSampleRate
+    let expectedChannels = isInput ? inputChannels : 2
     let bus: UInt32 = isInput ? 1 : 0
     for clientSide in [false, true] {
       let scope = (isInput == clientSide) ? kAudioUnitScope_Output : kAudioUnitScope_Input
@@ -678,16 +860,18 @@ final class AudioEngine: @unchecked Sendable {
           unit, kAudioUnitProperty_StreamFormat, scope, bus, &format, &formatSize),
         "verify \(label) \(clientSide ? "client" : "device") stream format")
       guard formatSize == MemoryLayout<AudioStreamBasicDescription>.size,
-        format.mSampleRate == Self.targetSampleRate,
-        format.mChannelsPerFrame >= requiredChannels
+        format.mSampleRate.isFinite, format.mSampleRate > 0,
+        format.mChannelsPerFrame > 0
       else {
         throw EngineError.setupFailed(
           "The selected \(label) stream format changed (channels/rate). Downmix stopped safely.")
       }
       if clientSide {
-        let expected = streamFormat(channels: UInt32(requiredChannels))
+        let expected = streamFormat(
+          channels: UInt32(expectedChannels), sampleRate: expectedRate)
         guard format.mFormatID == expected.mFormatID,
           format.mFormatFlags == expected.mFormatFlags,
+          format.mSampleRate == expected.mSampleRate,
           format.mChannelsPerFrame == expected.mChannelsPerFrame,
           format.mBytesPerFrame == expected.mBytesPerFrame,
           format.mBytesPerPacket == expected.mBytesPerPacket,
@@ -752,10 +936,11 @@ final class AudioEngine: @unchecked Sendable {
           AudioObjectGetPropertyData(stream, &address, 0, nil, &size, &format),
           "verify \(label) device stream format")
         guard size == MemoryLayout<AudioStreamBasicDescription>.size,
-          format.mSampleRate == Self.targetSampleRate, format.mChannelsPerFrame > 0
+          format.mSampleRate.isFinite, format.mSampleRate > 0,
+          format.mChannelsPerFrame > 0
         else {
           throw EngineError.setupFailed(
-            "The selected \(label) device stream is no longer compatible with 48 kHz. Downmix stopped safely."
+            "The selected \(label) device stream is no longer usable. Downmix stopped safely."
           )
         }
       }
@@ -769,6 +954,13 @@ final class AudioEngine: @unchecked Sendable {
     if let meters { status.meters = meters }
     // The layout certificate belongs to one live run; anything else reports no claim.
     if phase != .running && phase != .keepAlive { status.bedLayoutInstalled = nil }
+    if phase == .running && !keepAliveOnly {
+      status.inputSampleRate = inputDeviceRate
+      status.inputChannelCount = inputChannels
+    } else {
+      status.inputSampleRate = nil
+      status.inputChannelCount = nil
+    }
     if phase == .running || phase == .keepAlive || phase == .error {
       status.diagnostics = diagnosticsSnapshot()
       // Failure counters remain inspectable, but stopped audio has no queued latency.
@@ -801,8 +993,7 @@ final class AudioEngine: @unchecked Sendable {
 
     let channels = inputChannels
     let samples = Int(frameCount) * channels
-    let stereoSamples = Int(frameCount) * 2
-    guard samples <= inputData.count, stereoSamples <= scratchStereo.count else {
+    guard samples <= inputData.count else {
       audioDiagnostics.recordRejectedSlice(error: kAudioUnitErr_TooManyFramesToProcess)
       return kAudioUnitErr_TooManyFramesToProcess
     }
@@ -825,17 +1016,41 @@ final class AudioEngine: @unchecked Sendable {
     if let configuration = configurationMailbox.consumeLatest() {
       processor.apply(realtimeConfiguration: configuration)
     }
-    inputData.withUnsafeBufferPointer { inBuf in
-      scratchStereo.withUnsafeMutableBufferPointer { outBuf in
-        processor.process(
-          input: inBuf.baseAddress!,
-          inputChannelCount: channels,
-          output: outBuf.baseAddress!,
-          frameCount: Int(frameCount)
-        )
+
+    // Device rate → 48 kHz DSP rate. No converter means the device already runs at 48 kHz.
+    var processedFrames = Int(frameCount)
+    if let converter = inputRateConverter {
+      processedFrames = inputData.withUnsafeBufferPointer { inBuf in
+        convertedInput.withUnsafeMutableBufferPointer { outBuf in
+          converter.process(
+            input: inBuf.baseAddress!, frameCount: Int(frameCount),
+            output: outBuf.baseAddress!, capacity: maximumConvertedFrames)
+        }
+      }
+      guard processedFrames > 0, processedFrames <= maximumConvertedFrames,
+        processedFrames * 2 <= scratchStereo.count
+      else { return noErr }
+      convertedInput.withUnsafeBufferPointer { inBuf in
+        scratchStereo.withUnsafeMutableBufferPointer { outBuf in
+          processor.process(
+            input: inBuf.baseAddress!, inputChannelCount: channels,
+            output: outBuf.baseAddress!, frameCount: processedFrames)
+        }
+      }
+    } else {
+      guard processedFrames * 2 <= scratchStereo.count else {
+        audioDiagnostics.recordRejectedSlice(error: kAudioUnitErr_TooManyFramesToProcess)
+        return kAudioUnitErr_TooManyFramesToProcess
+      }
+      inputData.withUnsafeBufferPointer { inBuf in
+        scratchStereo.withUnsafeMutableBufferPointer { outBuf in
+          processor.process(
+            input: inBuf.baseAddress!, inputChannelCount: channels,
+            output: outBuf.baseAddress!, frameCount: processedFrames)
+        }
       }
     }
-    framesSinceMeterPublish += Int(frameCount)
+    framesSinceMeterPublish += processedFrames
     if framesSinceMeterPublish >= 4800 {
       framesSinceMeterPublish %= 4800
       let meters = processor.takeRealtimeMeterSnapshot()
@@ -845,6 +1060,7 @@ final class AudioEngine: @unchecked Sendable {
 
     // Explicit stereo alignment using the existing ring API. With one producer, writable
     // space can only grow between this snapshot and write(), so it cannot truncate to odd.
+    let stereoSamples = processedFrames * 2
     let writable = min(stereoSamples, ring.availableToWrite)
     let alignedCount = writable - writable % 2
     if alignedCount > 0 {
@@ -906,6 +1122,14 @@ final class AudioEngine: @unchecked Sendable {
     guard isRunning else { return }
     do {
       try self.verifyRoutes()
+      // A player or sample-rate switcher changed the input format: reopen the input
+      // unit instead of reporting a failure. The stereo output keeps running.
+      try self.reconfigureInputIfNeeded()
+      if !self.keepAliveOnly {
+        self.status.inputSampleRate = self.inputDeviceRate
+        self.status.inputChannelCount = self.inputChannels
+        self.status.message = Self.runningMessage(inputRate: self.inputDeviceRate)
+      }
     } catch {
       self.logger.error("Audio route lost: \(error.localizedDescription)")
       do {

@@ -17,6 +17,7 @@ swiftc -swift-version 6 \
   Sources/Downmix/DSP/Biquad.swift \
   Sources/Downmix/DSP/DownmixProcessor.swift \
   Sources/Downmix/Audio/RingBuffer.swift \
+  Sources/Downmix/Audio/InputRateConverter.swift \
   Checks/main.swift \
   -o "$CHECK_DIR/downmix-dsp-check"
 "$CHECK_DIR/downmix-dsp-check"

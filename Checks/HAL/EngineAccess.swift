@@ -11,4 +11,8 @@ extension AudioEngine {
   var checkStorageAllocated: Bool {
     outputRenderer != nil && (keepAliveOnly || (!inputData.isEmpty && ring != nil))
   }
+
+  var checkInputRate: Double { inputDeviceRate }
+  var checkInputChannels: Int { inputChannels }
+  var checkHasRateConverter: Bool { inputRateConverter != nil }
 }

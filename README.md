@@ -91,13 +91,17 @@ speakers.
 If your device list is long, use the filter box. You can pin the devices you use most from
 their right-click menu and drag them into the order you like.
 
-**Setup Checklist** explains the selected device, 48 kHz, permission, the installed speaker
-layout, and manual routing
-requirements. **Advanced** shows buffer negotiation and current-run diagnostics. Queue latency
+**Setup Checklist** explains the selected devices, their live sample rates, permission, the
+installed speaker layout, and manual routing
+requirements. Device rates do not have to be 48 kHz: Downmix follows the rate your player or
+sample-rate switcher gives the input device, converts it to its internal 48 kHz, and lets
+Core Audio convert the stereo mix to the output device's rate. Apple Music moving BlackHole
+between 44.1, 48 and 96 kHz no longer stops rendering; a brief re-prime follows the switch. **Advanced** shows buffer negotiation and current-run diagnostics. Queue latency
 is only the audio waiting inside Downmix, not your total listening latency.
-Small differences between the two 48 kHz device clocks are corrected automatically.
+Small differences between the two device clocks are corrected automatically.
 This uses a reservoir of at least **42.7 ms**, increasing with larger device buffers;
-initial priming is silent. It does not support other nominal sample rates.
+initial priming is silent. Rates between 8 kHz and 768 kHz are accepted; the input is
+converted internally to 48 kHz and the output keeps a 48 kHz client format.
 Device setup and cleanup run in the background; Stop mutes future callbacks without
 waiting for cleanup (already-buffered hardware audio may finish).
 
@@ -161,15 +165,41 @@ does not start audio. Audio-route **Retry** is separate.
 **It says microphone access is required.** Enable **Downmix** in **System Settings →
 Privacy & Security → Microphone**, then retry **Start**.
 
-**It says a device must be at 48 kHz.** Set both selected devices to **48,000 Hz** in
-**Audio MIDI Setup**, then retry. Downmix does not resample other device rates.
+**A rate switch made the sound drop out briefly.** When Apple Music (or a sample-rate
+switcher such as LosslessSwitcher or SampleRateSwitcher) changes the input device's rate,
+Downmix reopens only its input and continues rendering. The output keeps playing buffered
+audio and then re-primes for roughly a quarter of a second. A track change hides this gap.
+
+**It says the input or output rate is not supported.** Rates from 8 kHz to 768 kHz are
+accepted. Set the device to a normal rate such as 44,100 or 48,000 Hz in **Audio MIDI
+Setup**, then press **Start** again.
+
+**Something went wrong and I want details.** Open **Transport → Show Diagnostic Log** (or
+**Advanced → Show diagnostic log**). Nothing is uploaded; the file stays on your Mac.
+
+## Diagnostic log
+
+Downmix keeps a local log at `~/Library/Logs/Downmix/downmix.log`. It records:
+
+- session start and clean exit, so the next launch can report whether the previous session
+  ended abruptly (crash, forced quit or power loss);
+- every failure with the run's counters (buffer sizes, underruns, overruns, rejected slices,
+  render errors, rebuffers, queued frames);
+- device selections and their sample rates, including rate changes;
+- a heartbeat every 20 seconds while rendering;
+- a marker from a pre-opened file descriptor if the process dies on a fatal signal.
+
+The log rotates at 512 KB and keeps two older files (`downmix.1.log`, `downmix.2.log`).
+Open it from **Transport → Show Diagnostic Log**, **Advanced → Show diagnostic log**, or
+**Settings → Advanced → Diagnostics**. Logging failures never interrupt audio.
 
 ## Privacy
 
 Downmix processes audio entirely on your Mac. It has no network code and sends nothing
 anywhere. It does not change your system sound settings — you choose those yourself in
 System Settings. Its own settings live in a single file at
-`~/Library/Application Support/Downmix/preferences.json`.
+`~/Library/Application Support/Downmix/preferences.json`; its diagnostic log stays in
+`~/Library/Logs/Downmix/`.
 
 ---
 
@@ -281,7 +311,8 @@ GitHub Releases instead of committing it.
 
 ## DSP notes
 
-- Sample rate locked to **48 kHz**
+- Internal DSP rate **48 kHz**; input device rate is followed and converted (8–768 kHz),
+  output keeps a 48 kHz client format that Core Audio converts to the device
 - Bed order: `L R C LFE Ls Rs Lrs Rrs Lw Rw Ltf Rtf Ltm Rtm Ltr Rtr`
 - Center: `-3 dB` to both sides (`0.7071`)
 - Surround/height: hard-panned L/R
@@ -304,7 +335,9 @@ hardware-profiled; see [profiling instructions](docs/profiling.md) rather than a
 
 ## Limitations
 
-- 48 kHz only; unsupported rates are rejected and running routes stop if the rate changes.
+- Input rates outside 8–768 kHz are rejected. A live rate or channel-width switch reopens only
+  the input unit, which costs a brief (~0.25 s) audible gap while the reservoir re-primes.
+- Input devices narrower than 16 channels render only the bed slots they expose.
 - Configuration/meters now use preallocated POD mailboxes instead of a shared DSP lock.
   Off-main setup/teardown and bounded independent-device clock correction are implemented.
   Runtime Instruments/CPU profiling and hardware qualification remain pending in

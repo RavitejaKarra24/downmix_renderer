@@ -500,6 +500,14 @@ private struct AdvancedSettingsPane: View {
 
       Section("Diagnostics") {
         EngineDiagnosticsView()
+
+        Button {
+          DiagnosticLogActions.reveal()
+        } label: {
+          Label("Show diagnostic log", systemImage: "doc.text.magnifyingglass")
+        }
+        .accessibilityIdentifier("settings.showLog")
+        .accessibilityHint("Opens the failure and lifecycle log in Finder")
       }
 
       Section("Output") {

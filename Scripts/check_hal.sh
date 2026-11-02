@@ -30,6 +30,7 @@ SOURCES=(
   Sources/Downmix/DSP/DownmixProcessor.swift
   Sources/Downmix/Audio/DeviceManager.swift
   Sources/Downmix/Audio/InputChannelLayout.swift
+  Sources/Downmix/Audio/InputRateConverter.swift
   Sources/Downmix/Audio/AudioRenderGate.swift
   Sources/Downmix/Audio/RealtimeMailbox.swift
   Sources/Downmix/Audio/AudioDiagnostics.swift

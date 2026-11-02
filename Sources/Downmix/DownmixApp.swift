@@ -1,8 +1,21 @@
+import AppKit
 import SwiftUI
 
 @main
 struct DownmixApp: App {
-  @State private var appState = AppState()
+  @State private var appState: AppState
+
+  init() {
+    let info = Bundle.main.infoDictionary
+    let version = info?["CFBundleShortVersionString"] as? String ?? "development"
+    let build = info?["CFBundleVersion"] as? String ?? "-"
+    DownmixLog.shared.beginSession(
+      version: "\(version) (\(build))",
+      details: ["executable=\(Bundle.main.bundlePath)"])
+    let state = AppState()
+    state.logStartupSummary()
+    _appState = State(initialValue: state)
+  }
 
   var body: some Scene {
     Window("Downmix", id: "main") {
@@ -24,6 +37,12 @@ struct DownmixApp: App {
         }
         .keyboardShortcut("r", modifiers: [.command, .shift])
         .disabled(!appState.canRetrySavedRoute)
+
+        Divider()
+
+        Button("Show Diagnostic Log") {
+          DiagnosticLogActions.reveal()
+        }
       }
     }
 

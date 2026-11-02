@@ -21,6 +21,8 @@ swift format lint --strict \
   Sources/Downmix/Audio/AudioEngineControlling.swift \
   Sources/Downmix/Audio/AsyncAudioEngineController.swift \
   Sources/Downmix/Audio/AudioRenderGate.swift \
+  Sources/Downmix/Audio/AudioDeviceMonitor.swift \
+  Sources/Downmix/Diagnostics/DownmixLog.swift \
   Sources/Downmix/AppState.swift \
   Checks/AsyncControl/main.swift
 
@@ -33,6 +35,7 @@ swiftc -sdk "$SDKROOT" -swift-version 6 -parse-as-library \
   Sources/Downmix/DSP/Biquad.swift \
   Sources/Downmix/DSP/DownmixProcessor.swift \
   Sources/Downmix/Audio/*.swift \
+  Sources/Downmix/Diagnostics/*.swift \
   Sources/Downmix/AppState.swift \
   Checks/AsyncControl/main.swift \
   -o "$CHECK_DIR/downmix-async-control-check"

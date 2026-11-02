@@ -11,6 +11,7 @@ swift format lint --strict \
   Sources/Downmix/AppState.swift \
   Sources/Downmix/Audio/AudioEngineControlling.swift \
   Sources/Downmix/Audio/DeviceManager.swift \
+  Sources/Downmix/Diagnostics/DownmixLog.swift \
   Checks/Lifecycle/main.swift
 
 # Compile the actual backend as well as its injectable control interface, without UI/app entry.
@@ -21,6 +22,7 @@ swiftc -swift-version 6 -parse-as-library -target "$(uname -m)-apple-macos15.0" 
   Sources/Downmix/DSP/Biquad.swift \
   Sources/Downmix/DSP/DownmixProcessor.swift \
   Sources/Downmix/Audio/*.swift \
+  Sources/Downmix/Diagnostics/*.swift \
   Sources/Downmix/AppState.swift \
   Checks/Lifecycle/main.swift \
   -o "$CHECK_DIR/downmix-lifecycle-check"

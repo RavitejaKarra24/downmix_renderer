@@ -210,10 +210,12 @@ optimized builds. Release fixtures reject failed UI/package gates, committed whi
 wrong builds, stale source digests, thin binaries and invalid signatures while preserving
 the prior archive. These are deterministic contracts, not real driver certification.
 
-The latest lifecycle suite has **13 groups**, asynchronous control **11**, and UI **11**
-(**1 deterministic ordering + 10 rendered native**), including favorites/search, Settings
-transport/buffer/keep-alive, setup-sheet fake permission/cancellation and save recovery.
-The legacy **61,236 DSP/ring assertions** and clock/transport/mailbox suites remain intact.
+The lifecycle suite has **14 groups** (including diagnostics-log behavior), asynchronous
+control **11**, and UI **11** (**1 deterministic ordering + 10 rendered native**), including
+favorites/search, Settings transport/buffer/keep-alive, setup-sheet fake
+permission/cancellation and save recovery. The DSP/ring suite has **61,728 assertions**
+(content layouts, input rate conversion, matrix/ring/clock) and the clock/transport/mailbox
+suites remain intact.
 
 **Local verification passed:** strict formatting, whitespace/shell checks, every normal
 suite above, the full debug build and rendered native UI gate. Realtime mailbox, output/
@@ -223,6 +225,74 @@ without findings. `Scripts/package_zip.sh` completed both optimized architecture
 universal architecture, metadata and current-source digest verification. `Downmix.zip`
 is regenerated. The documented CLT search-path/native-AX fixture warnings remain; no
 real app/audio playback was launched, and no commits or remote releases were made.
+
+### Device-rate follow-through — 1.4.0 (build 6)
+
+Reported symptom: while Apple Music played Atmos, Downmix reported "input must expose at
+least 16 channels at 48 kHz" or "the selected input is no longer at 48 kHz". The channel
+wording was misleading: the failing condition was the sample rate, not the width.
+
+Root cause (measured on the reporting Mac): the input device's nominal rate follows the
+content. BlackHole sat at 44.1 kHz, and the running `SampleRateSwitcher` helper moved it
+between 44.1/48/96 kHz as tracks changed. Downmix required 48 kHz at Start and in its
+watchdog, so the first non-48 kHz state either blocked Start or stopped a healthy run.
+
+Measurement that shaped the fix: with BlackHole at 44.1/96/192 kHz, an AUHAL **input** unit
+whose client format was 48 kHz failed every `AudioUnitRender` with
+`kAudioUnitErr_CannotDoInCurrentContext` (-10863), even though the same mismatch worked on
+the built-in microphone and on the **output** side. AUHAL therefore cannot be relied on to
+convert virtual-device input rates.
+
+Implementation:
+
+- `InputRateConverter` opens the input at the device's own rate and converts to the fixed
+  48 kHz DSP rate with `AudioConverter` (float32 interleaved, mastering complexity). `nil`
+  when the device is already at 48 kHz, so the normal path keeps zero added CPU and latency.
+- The input client format follows the live device width, clamped to the 16 bed slots. The
+  processor's input width is published through the existing mailbox after each reopen.
+- The watchdog compares the live device rate/width with the run's format. A change reopens
+  only the input unit (stop → set format → reallocate → initialize → start); the output unit
+  and stereo queue keep running and re-prime in about a quarter of a second. A width below
+  two channels, or a rate outside 8–768 kHz, still stops with a specific message. A render
+  that fails with `kAudioUnitErr_CannotDoInCurrentContext` between the device's change and
+  the reopen is counted but cleared as stale after the reopen, so the transient cannot stop
+  a healthy run.
+- Output keeps a 48 kHz client format and lets AUHAL convert to the output device rate; a
+  live output rate change is no longer treated as a failure. Start no longer requires a
+  48 kHz device, and the status/checklist report the live input format and the conversion.
+- Input width below 16 channels is accepted at Start and by the engine: the bed slots the
+  device exposes are rendered and the rest stay silent, instead of refusing to run.
+- A rotating local diagnostic log records sessions, failures with run counters, device
+  formats/rate changes, a 20-second heartbeat and fatal-signal markers, and detects a
+  previous session that ended abruptly. UI: Transport menu, Advanced panel, Settings →
+  Advanced.
+
+Deterministic verification added: `Checks/HAL` covers 44.1/96 kHz starts, live
+44.1↔48↔96 kHz switches (input-only reopen, output keeps running), width narrowing/widening,
+one-channel and out-of-band refusals, and output rate changes. `Checks/main.swift` covers
+stereo/5.1/7.1/9.1/9.1.6 content layouts, narrow devices, and converter gain/frequency/frame
+accounting at 32/44.1/88.2/96/192 kHz with mixed block sizes. `Checks/Lifecycle` covers log
+silence before a session, failure lines, unclean-stop detection, clean exit and rotation.
+
+Real-hardware verification on the development Mac (actual `AudioEngine`, BlackHole 16ch
+input, silent Dolby Audio Bridge loopback captured with a second AUHAL unit; player and
+engine at each device rate):
+
+- stereo, 5.1, 7.1, 9.1 and 9.1.6 content at 44.1 kHz: every fed bed slot's meter and the
+  captured stereo L/R RMS matched the ADC2 matrix sums; unfed slots stayed at -120 dBFS.
+- live 44.1 → 48 → 96 → 44.1 → 48 kHz switches: the engine stayed running, reported the new
+  rate and produced the same correct stereo output at every rate.
+- with `SampleRateSwitcher` left running it moved BlackHole 44.1 → 48 kHz during a run and
+  the engine followed it without stopping, reproducing and resolving the reported failure.
+- BlackHole's own device volume was at -12 dB, so absolute levels there are attenuated by the
+  driver; the harness verified equal per-channel trim plus the exact relative matrix sums.
+- Steady state showed no underruns; each rate switch/startup produced about 0.3 s of counted
+  re-priming silence while the queue refilled.
+
+Remaining: a channel or rate switch is not sample-continuous (about 0.25 s gap), the
+converter is not bit-exact to the device, and multi-hour playback/instrumentation on the
+user's devices is still pending. The hardware harness was an ad-hoc local tool and is not
+committed; the reproducible parts are the stub-HAL and DSP/offline checks above.
 
 ### Remaining release qualification
 

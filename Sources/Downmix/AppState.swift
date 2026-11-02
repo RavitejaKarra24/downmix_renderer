@@ -8,6 +8,19 @@ extension Notification.Name {
   static let downmixMetersDidChange = Notification.Name("com.local.downmix.metersDidChange")
 }
 
+extension AVAuthorizationStatus {
+  /// Stable text for the diagnostic log.
+  var diagnosticName: String {
+    switch self {
+    case .authorized: "authorized"
+    case .denied: "denied"
+    case .restricted: "restricted"
+    case .notDetermined: "notDetermined"
+    @unknown default: "unknown"
+    }
+  }
+}
+
 final class MeterSource: @unchecked Sendable {
   private let lock = NSLock()
   private var value = MeterSnapshot.empty
@@ -125,6 +138,9 @@ final class AppState {
   @ObservationIgnored private let preferenceWriter: (AppPreferences) throws -> Void
   @ObservationIgnored private var deviceMonitor: AudioDeviceMonitor?
   @ObservationIgnored private var notificationObservers: [NotificationObservation] = []
+  @ObservationIgnored private let log: any DiagnosticLogging
+  @ObservationIgnored private var heartbeatTask: Task<Void, Never>?
+  @ObservationIgnored private var lastLoggedDevices: String?
   @ObservationIgnored private var saveTask: Task<Void, Never>?
   @ObservationIgnored private var permissionRequestID: UUID?
   @ObservationIgnored private var didHandleAutomaticStart = false
@@ -146,7 +162,8 @@ final class AppState {
     },
     routeSafetyProvider: ((AudioDeviceInfo, String) -> Bool)? = nil,
     preferenceWriter: @escaping (AppPreferences) throws -> Void = { try $0.save() },
-    installListeners: Bool = true
+    installListeners: Bool = true,
+    log: any DiagnosticLogging = DownmixLog.shared
   ) {
     self.engine = engine
     self.preferences = preferences
@@ -161,6 +178,7 @@ final class AppState {
     self.permissionRequestProvider = permissionRequestProvider
     self.routeSafetyProvider = routeSafetyProvider
     self.preferenceWriter = preferenceWriter
+    self.log = log
     engine.setStatusHandler { [weak self] update in
       // The UI bridge delivers logical intents synchronously and generation-filtered
       // worker snapshots on main, never from a render callback.
@@ -200,7 +218,12 @@ final class AppState {
     let input = inputDevices.first { $0.id == selectedInputID }
     let output = outputDevices.first { $0.id == selectedOutputID }
     let authorization = permissionStatusProvider()
-    let inputReady = (input?.inputChannelCount ?? 0) >= 16
+    let inputChannels = input?.inputChannelCount ?? 0
+    let inputReady = inputChannels >= 16
+    let rateSupported =
+      input.map { InputRateConverter.supportedDeviceRates.contains($0.nominalSampleRate) } ?? false
+    let outputRateSupported =
+      output.map { $0.nominalSampleRate.isFinite && $0.nominalSampleRate > 0 } ?? false
     let outputReady =
       output.map {
         $0.outputChannelCount >= 2
@@ -231,21 +254,28 @@ final class AppState {
         SetupCheck(
           id: .input, title: "16-channel input",
           status: inputReady ? .verified : .needsAttention,
-          guidance: inputReady
-            ? input.map { "\($0.name) exposes \($0.inputChannelCount) input channels." } ?? ""
-            : "Select or reconnect a 16-channel input such as BlackHole 16ch."),
+          guidance: input.map { device in
+            inputReady
+              ? "\(device.name) exposes \(device.inputChannelCount) input channels."
+              : "\(device.name) exposes \(device.inputChannelCount) channels, so only that many bed slots are fed. BlackHole 16ch gives the full 9.1.6 bed."
+          } ?? "Select or reconnect a multichannel input such as BlackHole 16ch."),
         SetupCheck(
-          id: .inputRate, title: "Input at 48 kHz",
-          status: input?.nominalSampleRate == 48_000 ? .verified : .needsAttention,
-          guidance: input?.nominalSampleRate == 48_000
-            ? "Selected input reports 48,000 Hz."
-            : "Select an input and set its format to 48,000 Hz in Audio MIDI Setup."),
+          id: .inputRate, title: "Input format",
+          status: rateSupported ? .verified : .needsAttention,
+          guidance: input.map { device in
+            rateSupported
+              ? Self.conversionText(device.nominalSampleRate, direction: "converted to 48 kHz")
+              : "\(Self.rateText(device.nominalSampleRate)) is outside the supported 8–768 kHz band."
+          } ?? "Select an input to read its sample rate."),
         SetupCheck(
-          id: .outputRate, title: "Output at 48 kHz",
-          status: output?.nominalSampleRate == 48_000 ? .verified : .needsAttention,
-          guidance: output?.nominalSampleRate == 48_000
-            ? "Selected output reports 48,000 Hz."
-            : "Select an output and set its format to 48,000 Hz in Audio MIDI Setup."),
+          id: .outputRate, title: "Output format",
+          status: outputRateSupported ? .verified : .needsAttention,
+          guidance: output.map { device in
+            outputRateSupported
+              ? Self.conversionText(
+                device.nominalSampleRate, direction: "the stereo mix renders at 48 kHz")
+              : "The selected output reports no usable sample rate."
+          } ?? "Select an output to read its sample rate."),
         SetupCheck(
           id: .output, title: "Safe stereo output",
           status: outputReady ? .verified : .needsAttention,
@@ -288,6 +318,46 @@ final class AppState {
           "Downmix installs the 9.1.6 bed layout on the input when rendering starts, so players deliver every bed channel instead of stereo."
       )
     }
+  }
+
+  private static func rateText(_ rate: Double) -> String {
+    guard rate.isFinite, rate > 0 else { return "No sample rate" }
+    return "\(Int(rate.rounded())) Hz"
+  }
+
+  private static func conversionText(_ rate: Double, direction: String) -> String {
+    "\(rateText(rate)): \(direction)."
+  }
+
+  /// Logs the saved configuration once at launch, before any device is opened.
+  func logStartupSummary() {
+    let system = ProcessInfo.processInfo.operatingSystemVersionString
+    let authorization = permissionStatusProvider()
+    log.log(
+      .info, "startup",
+      "macOS=\(system) permission=\(authorization.diagnosticName)"
+        + " savedInput=\(preferences.inputDeviceName.isEmpty ? "-" : preferences.inputDeviceName)"
+        + " savedOutput=\(preferences.outputDeviceName.isEmpty ? "-" : preferences.outputDeviceName)"
+        + " layout=\(preferences.layoutPresetName) preampDb=\(preferences.preampDb)"
+        + " frames=\(preferences.framesPerBuffer) keepAlive=\(preferences.keepOutputAlive)"
+        + " autoStart=\(preferences.autoStart)")
+  }
+
+  private func logSelectedDevicesIfChanged(_ snapshot: DeviceCatalogSnapshot) {
+    let input = snapshot.devices.first { $0.id == selectedInputID }
+    let output = snapshot.devices.first { $0.id == selectedOutputID }
+    let summary =
+      "input=\(Self.deviceSummary(input)) output=\(Self.deviceSummary(output))"
+    guard summary != lastLoggedDevices else { return }
+    lastLoggedDevices = summary
+    log.log(.info, "devices", "selected \(summary)")
+  }
+
+  private static func deviceSummary(_ device: AudioDeviceInfo?) -> String {
+    guard let device else { return "none" }
+    let rate = Int(device.nominalSampleRate.rounded())
+    return "\(device.name)[\(device.id) \(device.inputChannelCount)in/"
+      + "\(device.outputChannelCount)out \(rate)Hz]"
   }
 
   func refreshDevices() {
@@ -347,6 +417,9 @@ final class AppState {
       preferences.outputDeviceUID = device.uid
       preferences.outputDeviceName = device.name
     }
+
+    logSelectedDevicesIfChanged(snapshot)
+    deviceMonitor?.watch(devices: [selectedInputID, selectedOutputID].compactMap { $0 })
 
     // While authorization is pending there is no active route to compare. An unrelated
     // hotplug event must not cancel the user's permission request.
@@ -508,8 +581,12 @@ final class AppState {
       failAndStop("Selected audio devices are unavailable. Refresh or reconnect them.")
       return
     }
-    guard input.inputChannelCount >= 16 else {
-      failAndStop("Input must expose at least 16 channels (BlackHole 16ch configured as 9.1.6).")
+    // The bed is 16 channels wide, but a narrower device still renders the slots it has.
+    // Rate is not a precondition: the engine follows the device rate and converts it.
+    guard input.inputChannelCount >= 2 else {
+      failAndStop(
+        "Input must expose at least two channels. Select BlackHole 16ch (or a wider interface) and retry."
+      )
       return
     }
     guard output.outputChannelCount >= 2 else {
@@ -622,6 +699,9 @@ final class AppState {
   }
 
   private func receiveStatus(_ update: EngineStatus, isExplicitStop: Bool = false) {
+    let previousPhase = status.phase
+    let previousMessage = status.message
+    defer { logTransition(previousPhase: previousPhase, previousMessage: previousMessage) }
     // Cleanup is not a new UI intent. A delayed stop acknowledgement must not
     // cancel a newer permission request or erase a locally preserved failure.
     // Explicit Stop clears these intents synchronously in stopRenderer().
@@ -634,6 +714,18 @@ final class AppState {
     if status.phase != update.phase || status.message != update.message {
       status.phase = update.phase
       status.message = update.message
+    }
+    // Run-scoped certificates and the live input format belong to the worker's run and
+    // drive the checklist/log. Assign only on change: a diagnostics-only publication
+    // must not invalidate the observed transport status every UI tick.
+    if status.bedLayoutInstalled != update.bedLayoutInstalled {
+      status.bedLayoutInstalled = update.bedLayoutInstalled
+    }
+    if status.inputSampleRate != update.inputSampleRate {
+      status.inputSampleRate = update.inputSampleRate
+    }
+    if status.inputChannelCount != update.inputChannelCount {
+      status.inputChannelCount = update.inputChannelCount
     }
     let isInactive = update.phase == .stopped || update.phase == .error
     var nextDiagnostics = update.phase == .stopped ? EngineDiagnostics.empty : update.diagnostics
@@ -659,6 +751,60 @@ final class AppState {
       didHandleAutomaticStart = true
       errorMessage = update.message
     }
+  }
+
+  /// One log line per visible status transition, plus full failure counters.
+  private func logTransition(previousPhase: EnginePhase, previousMessage: String) {
+    guard status.phase != previousPhase || status.message != previousMessage else { return }
+    switch status.phase {
+    case .error:
+      heartbeatTask?.cancel()
+      heartbeatTask = nil
+      log.logFailure(
+        status.message,
+        context:
+          "run failed input=\(Self.deviceSummary(inputDevices.first { $0.id == selectedInputID }))"
+          + " output=\(Self.deviceSummary(outputDevices.first { $0.id == selectedOutputID }))",
+        diagnostics: diagnostics)
+    case .running, .keepAlive:
+      heartbeatTask?.cancel()
+      heartbeatTask = Task { [weak self] in await self?.logHeartbeats() }
+      log.log(
+        .info, "engine",
+        "phase=\(status.phase.rawValue) message=\(status.message)"
+          + " inputRate=\(status.inputSampleRate.map { String(Int($0.rounded())) } ?? "-")"
+          + " inputChannels=\(status.inputChannelCount.map(String.init) ?? "-")")
+    case .stopped, .starting:
+      if status.phase == .stopped {
+        heartbeatTask?.cancel()
+        heartbeatTask = nil
+      }
+      log.log(.info, "engine", "phase=\(status.phase.rawValue) message=\(status.message)")
+    case .stopping:
+      log.log(.info, "engine", "phase=stopping message=\(status.message)")
+    }
+  }
+
+  /// A slow heartbeat means an abrupt stop still shows what the app was doing.
+  private func logHeartbeats() async {
+    while !Task.isCancelled {
+      do {
+        try await Task.sleep(for: .seconds(20))
+      } catch { return }
+      guard isRunning || isKeepingOutputAwake else { return }
+      log.log(
+        .info, "heartbeat",
+        "phase=\(status.phase.rawValue) input=\(Self.deviceSummary(inputDevices.first { $0.id == selectedInputID }))"
+          + " output=\(Self.deviceSummary(outputDevices.first { $0.id == selectedOutputID }))"
+          + " diagnostics=\(Self.diagnosticsSummary(diagnostics))")
+    }
+  }
+
+  private static func diagnosticsSummary(_ diagnostics: EngineDiagnostics) -> String {
+    "buffers=\(diagnostics.requestedBufferFrames)/\(diagnostics.inputBufferFrames)/\(diagnostics.outputBufferFrames)"
+      + " underruns=\(diagnostics.underrunCount) overruns=\(diagnostics.overrunCount)"
+      + " rejected=\(diagnostics.rejectedSliceCount) renderErrors=\(diagnostics.renderErrorCount)"
+      + " queued=\(diagnostics.queuedFrames) ppm=\(diagnostics.correctionPPM)"
   }
 
   private func stopRenderer(preservingFailureDiagnostics: Bool = false) {
@@ -741,6 +887,7 @@ final class AppState {
       persistenceErrorMessage = nil
     } catch {
       persistenceErrorMessage = "Could not save settings: \(error.localizedDescription)"
+      log.log(.warning, "preferences", "save failed: \(error.localizedDescription)")
     }
   }
 
@@ -757,8 +904,11 @@ final class AppState {
         MainActor.assumeIsolated {
           guard let self else { return }
           if isTerminating {
+            self.log.log(.info, "lifecycle", "application terminating")
+            self.heartbeatTask?.cancel()
             self.flushPreferences()
             self.stopRenderer()
+            DownmixLog.shared.endSession()
           } else {
             self.refreshDevices()
           }
@@ -770,5 +920,6 @@ final class AppState {
 
   deinit {
     saveTask?.cancel()
+    heartbeatTask?.cancel()
   }
 }

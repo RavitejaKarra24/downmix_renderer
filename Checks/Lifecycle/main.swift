@@ -169,7 +169,82 @@ struct LifecycleChecks {
     try diagnosticsChecks()
     try await persistenceChecks()
     try await permissionChecks()
-    print("All AppState lifecycle checks passed (13 groups)")
+    try loggingChecks()
+    print("All AppState lifecycle checks passed (14 groups)")
+  }
+
+  /// The diagnostics log must stay silent in tests, record failures, detect an abrupt
+  /// stop on the next launch, and bound its own size.
+  @MainActor
+  static func loggingChecks() throws {
+    let directory = FileManager.default.temporaryDirectory
+      .appendingPathComponent("downmix-log-check-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let log = DownmixLog(directory: directory)
+    try require(!log.isEnabled, "Logging stays silent until the app opens a session")
+    log.log(.info, "test", "must be dropped")
+    try require(
+      !FileManager.default.fileExists(atPath: log.fileURL.path),
+      "Nothing is written before a session starts")
+
+    log.beginSession(version: "1.4.0 (6)", details: ["executable=check"])
+    log.log(.info, "devices", "selected input=Fixture")
+    log.logFailure(
+      "The selected input disconnected.", context: "run failed", diagnostics: nil)
+    log.flush()
+    let first = try String(contentsOf: log.fileURL, encoding: .utf8)
+    try require(
+      first.contains("session start version=1.4.0 (6)"),
+      "Session start is recorded with its version")
+    try require(first.contains("selected input=Fixture"), "Ordinary lines are recorded")
+    try require(
+      first.contains("ERROR[engine] run failed: The selected input disconnected."),
+      "Failures are recorded with level, category and message")
+    try require(!first.contains("clean exit"), "An abrupt stop leaves no clean-exit marker")
+
+    // The next launch reports the previous abrupt stop.
+    let second = DownmixLog(directory: directory)
+    second.beginSession(version: "1.4.0 (7)")
+    second.flush()
+    var text = try String(contentsOf: second.fileURL, encoding: .utf8)
+    try require(
+      text.contains("previous session ended without a clean exit"),
+      "An unclean previous session is reported on the next launch")
+    second.endSession(reason: "check")
+    let afterCleanExit = try String(contentsOf: second.fileURL, encoding: .utf8)
+    try require(
+      afterCleanExit.contains("clean exit reason=check"), "A clean exit is recorded")
+
+    let third = DownmixLog(directory: directory)
+    third.beginSession(version: "1.4.0 (8)")
+    third.flush()
+    text = try String(contentsOf: third.fileURL, encoding: .utf8)
+    let lines = text.split(separator: "\n")
+    let sessionStart = lines.lastIndex { $0.contains("session start version=1.4.0 (8)") } ?? 0
+    let currentSession = lines[sessionStart...]
+    try require(
+      !currentSession.contains(where: { $0.contains("without a clean exit") }),
+      "A clean previous session produces no warning")
+
+    // Rotation keeps the file bounded and preserves the previous file.
+    for index in 0..<700 {
+      third.log(.info, "rotation", String(repeating: "x", count: 1_000) + "\(index)")
+    }
+    third.flush()
+    let archive = directory.appendingPathComponent("downmix.1.log")
+    let mainSize =
+      (try FileManager.default.attributesOfItem(atPath: third.fileURL.path)[.size] as? NSNumber)?
+      .intValue ?? 0
+    try require(
+      FileManager.default.fileExists(atPath: archive.path),
+      "An oversized log is rotated instead of growing without bound")
+    try require(
+      mainSize < DownmixLog.maximumFileBytes + 2_000,
+      "The active log stays near its size limit after rotation")
+    third.endSession()
+    print(
+      "PASS diagnostics log: silent until session start, failures, unclean-stop detection, clean exit, rotation"
+    )
   }
 
   @MainActor
@@ -570,6 +645,25 @@ struct LifecycleChecks {
         "Denied/restricted authorization must show settings guidance, not a permission prompt")
     }
 
+    // The checklist must report the live run's speech-layout certificate, not a stale claim.
+    state.start()
+    fixture.engine.emit(
+      EngineStatus(
+        phase: .running, message: "Stereo renderer running · 44.1 kHz → 48 kHz",
+        bedLayoutInstalled: true, inputSampleRate: 44_100, inputChannelCount: 16))
+    try require(
+      state.setupChecklist.checks.first { $0.id == .speakerMapping }?.status == .verified,
+      "A running run with an accepted bed layout certifies the speaker mapping")
+    try require(
+      state.status.inputSampleRate == 44_100 && state.status.inputChannelCount == 16,
+      "Live input format reaches AppState")
+    fixture.engine.emit(
+      EngineStatus(phase: .running, message: "Stereo renderer running", bedLayoutInstalled: false))
+    try require(
+      state.setupChecklist.checks.first { $0.id == .speakerMapping }?.status == .needsAttention,
+      "A refused bed layout needs attention instead of staying manual")
+    state.stop()
+
     fixture.permissionStatus = .authorized
     fixture.safeRoute = false
     state.refreshDevices()
@@ -586,10 +680,40 @@ struct LifecycleChecks {
         inputChannelCount: 0, outputChannelCount: 1, nominalSampleRate: 96_000),
     ]
     state.refreshDevices()
+    var narrow = state.setupChecklist
     try require(
-      state.setupChecklist.checks.filter { $0.status == .needsAttention }.map(\.id)
-        == [.input, .inputRate, .outputRate, .output],
-      "Wrong input/output channel counts and both sample rates must need attention")
+      narrow.checks.filter { $0.status == .needsAttention }.map(\.id) == [.input, .output],
+      "Narrow input and mono output must need attention, but other rates must not")
+    try require(
+      narrow.checks.first { $0.id == .inputRate }?.guidance.contains("converted to 48 kHz") == true
+        && narrow.checks.first { $0.id == .outputRate }?.status == .verified,
+      "Non-48 kHz devices are described as converted, not as failures")
+    try require(
+      narrow.checks.first { $0.id == .input }?
+        .guidance.contains("only that many bed slots") == true,
+      "A narrow input explains which slots are fed")
+
+    // A player rate switch must stay usable; only an impossible rate needs attention.
+    fixture.catalog = [
+      AudioDeviceInfo(
+        id: Fixture.input.id, name: Fixture.input.name, uid: Fixture.input.uid,
+        inputChannelCount: 16, outputChannelCount: 0, nominalSampleRate: 96_000),
+      AudioDeviceInfo(
+        id: Fixture.output.id, name: Fixture.output.name, uid: Fixture.output.uid,
+        inputChannelCount: 0, outputChannelCount: 2, nominalSampleRate: 44_100),
+    ]
+    state.refreshDevices()
+    try require(
+      state.setupChecklist.checks.filter { $0.status == .needsAttention }.isEmpty,
+      "44.1/96 kHz devices with the bed width are fully ready")
+    fixture.catalog[0] = AudioDeviceInfo(
+      id: Fixture.input.id, name: Fixture.input.name, uid: Fixture.input.uid,
+      inputChannelCount: 16, outputChannelCount: 0, nominalSampleRate: 4_000)
+    state.refreshDevices()
+    narrow = state.setupChecklist
+    try require(
+      narrow.checks.first { $0.id == .inputRate }?.status == .needsAttention,
+      "Rates outside the supported band must need attention")
 
     fixture.catalog = []
     state.refreshDevices()

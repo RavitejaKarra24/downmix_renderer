@@ -251,6 +251,20 @@ enum DeviceManager {
     return nil
   }
 
+  struct InputFormat: Sendable {
+    let channels: Int
+    let rate: Double
+  }
+
+  /// Live input width and nominal rate. Unlike the cached catalog these are read at the
+  /// moment of use, because players and sample-rate switchers change them while running.
+  static func inputFormat(id: AudioDeviceID) -> InputFormat? {
+    let channels = channelCount(id: id, scope: kAudioDevicePropertyScopeInput)
+    let rate = sampleRate(id: id)
+    guard channels > 0, rate.isFinite, rate > 0 else { return nil }
+    return InputFormat(channels: channels, rate: rate)
+  }
+
   static func channelCount(id: AudioDeviceID, scope: AudioObjectPropertyScope) -> Int {
     var property = AudioObjectPropertyAddress(
       mSelector: kAudioDevicePropertyStreamConfiguration,
@@ -283,7 +297,7 @@ enum DeviceManager {
     return total
   }
 
-  private static func sampleRate(id: AudioDeviceID) -> Double {
+  static func sampleRate(id: AudioDeviceID) -> Double {
     var property = AudioObjectPropertyAddress(
       mSelector: kAudioDevicePropertyNominalSampleRate,
       mScope: kAudioObjectPropertyScopeGlobal,

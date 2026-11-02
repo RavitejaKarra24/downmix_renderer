@@ -316,6 +316,162 @@ func checkLowpassAndHistory() {
   print("PASS: lowpass response, delay, block boundaries and configuration history")
 }
 
+/// Players deliver stereo, 5.1, 7.1, 9.1 or the full 9.1.6 bed into the same 16-channel
+/// device, and narrower devices exist too. Verify each content layout lands on the
+/// expected bed slots and the expected stereo matrix sum.
+func checkSurroundContentLayouts() {
+  // Headroom keeps every layout below full scale so the sums are not clipped.
+  let preampDb = -6.0
+  let gain = pow(10.0, preampDb / 20)
+  let configuration = DownmixProcessor.Configuration(preampDb: preampDb, lfeLowpass: false)
+  func expected(_ values: [Int: Double], _ coefficients: [Double]) -> Double {
+    gain * values.reduce(0) { $0 + $1.value * coefficients[$1.key] }
+  }
+  let left = [1.0, 0, sqrt(0.5), 2.26464431, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0]
+  let right = [0.0, 1, sqrt(0.5), 2.26464431, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1]
+  // Bed order: L R C LFE Ls Rs Lrs Rrs Lw Rw Ltf Rtf Ltm Rtm Ltr Rtr.
+  let layouts: [(String, [Int: Double], Int)] = [
+    ("stereo", [0: 0.25, 1: 0.2], 2),
+    ("5.1", [0: 0.1, 1: 0.2, 2: 0.3, 3: 0.05, 4: 0.4, 5: 0.5], 6),
+    ("7.1", [0: 0.1, 1: 0.2, 2: 0.3, 3: 0.05, 4: 0.4, 5: 0.5, 6: 0.15, 7: 0.25], 8),
+    (
+      "9.1",
+      [
+        0: 0.1, 1: 0.2, 2: 0.3, 3: 0.05, 4: 0.4, 5: 0.5, 6: 0.15, 7: 0.25,
+        8: 0.12, 9: 0.22,
+      ], 10
+    ),
+    (
+      "9.1.6",
+      [
+        0: 0.1, 1: 0.2, 2: 0.3, 3: 0.05, 4: 0.4, 5: 0.5, 6: 0.15, 7: 0.25, 8: 0.12, 9: 0.22,
+        10: 0.07, 11: 0.09, 12: 0.06, 13: 0.08, 14: 0.05, 15: 0.11,
+      ],
+      16
+    ),
+  ]
+  for (name, content, channels) in layouts {
+    var config = configuration
+    config.inputChannelCount = channels
+    var processor = configured(config)
+    var input = [Float](repeating: 0, count: channels)
+    for (slot, amplitude) in content { input[slot] = Float(amplitude) }
+    let output = render(&processor, input, channels: channels)
+    requireNear(output[0], expected(content, left), "\(name) content sums to left", tolerance: 1e-5)
+    requireNear(
+      output[1], expected(content, right), "\(name) content sums to right", tolerance: 1e-5)
+    let meters = processor.takeMeterSnapshot()
+    for slot in 0..<16 {
+      let amplitude = content[slot] ?? 0
+      let expectedDb = amplitude > 0 ? 20 * log10(amplitude) : -120
+      requireNear(
+        meters.inputPeaksDb[slot], expectedDb, "\(name) meter slot \(slot)", tolerance: 1e-4)
+    }
+  }
+
+  // A narrower device keeps rendering: only the slots it can deliver contribute.
+  var narrow = configuration
+  narrow.inputChannelCount = 6
+  var narrowProcessor = configured(narrow)
+  var narrowInput = [Float](repeating: 0, count: 6)
+  for slot in 0..<6 { narrowInput[slot] = Float(0.1) * Float(slot + 1) }
+  let narrowOutput = render(&narrowProcessor, narrowInput, channels: 6)
+  let narrowContent: [Int: Double] = [0: 0.1, 1: 0.2, 2: 0.3, 3: 0.4, 4: 0.5, 5: 0.6]
+  requireNear(
+    narrowOutput[0], expected(narrowContent, left), "six-channel device left sum", tolerance: 1e-5)
+  requireNear(
+    narrowOutput[1], expected(narrowContent, right), "six-channel device right sum", tolerance: 1e-5
+  )
+  let narrowMeters = narrowProcessor.takeMeterSnapshot()
+  require(
+    narrowMeters.inputPeaksDb[6...].allSatisfy { $0 == -120 },
+    "Slots a narrow device cannot deliver stay silent")
+  print("PASS: stereo/5.1/7.1/9.1/9.1.6 content layouts and narrow devices")
+}
+
+/// The input device follows the player's rate now, so this converter is the path that
+/// keeps the fixed 48 kHz DSP correct at 44.1/96/192 kHz and wider blocks.
+func checkInputRateConversion() {
+  let blockSizes = [32, 64, 128, 512, 1024, 1, 37, 4096]
+  for (rate, channels) in [
+    (48_000.0, 16), (44_100.0, 16), (44_100.0, 2), (96_000.0, 16),
+    (88_200.0, 8), (192_000.0, 16), (32_000.0, 2),
+  ] {
+    guard let converter = InputRateConverter(deviceRate: rate, channelCount: channels) else {
+      require(rate == 48_000, "Only 48 kHz needs no converter")
+      continue
+    }
+    require(converter.deviceRate == rate && converter.channelCount == channels, "converter config")
+    let capacity = converter.outputCapacity(forInputFrames: 4096)
+    var output = [Float](repeating: 0, count: capacity * channels)
+    var input = [Float](repeating: 0, count: 4096 * channels)
+    var produced = 0
+    var consumed = 0
+    var phase = 0.0
+    var collected: [Float] = []
+    var blockIndex = 0
+    // Half a second of device-rate audio keeps the analysis window long at 192 kHz.
+    while consumed < Int(rate / 2) {
+      let frames = blockSizes[blockIndex % blockSizes.count]
+      blockIndex += 1
+      for frame in 0..<frames {
+        let left = Float(0.25 * sin(2 * .pi * 997 * phase / rate))
+        let right = Float(0.125 * sin(2 * .pi * 997 * phase / rate + 0.5))
+        for channel in 0..<channels {
+          input[frame * channels + channel] = channel == 0 ? left : (channel == 1 ? right : 0)
+        }
+        phase += 1
+      }
+      let count = input.withUnsafeBufferPointer { inBuffer in
+        output.withUnsafeMutableBufferPointer { outBuffer in
+          converter.process(
+            input: inBuffer.baseAddress!, frameCount: frames,
+            output: outBuffer.baseAddress!, capacity: capacity)
+        }
+      }
+      require(count >= 0 && count <= capacity, "converter stays inside its capacity")
+      if blockIndex > 2 { collected.append(contentsOf: output.prefix(count * channels)) }
+      produced += count
+      consumed += frames
+    }
+    let expected = Double(consumed) * 48_000 / rate
+    require(
+      abs(Double(produced) / expected - 1) < 0.006,
+      "\(rate) Hz frame accounting: \(produced) vs \(expected)")
+    let frames = collected.count / channels
+    let analysisStart = 1_000
+    let analysisEnd = frames - 1_000
+    require(analysisEnd - analysisStart > 9_600, "\(rate) Hz has a settled analysis window")
+    var sum = 0.0
+    var rightSum = 0.0
+    var crossings = 0
+    var previous: Float = 0
+    for frame in analysisStart..<analysisEnd {
+      let sample = collected[frame * channels]
+      sum += Double(sample * sample)
+      if channels > 1 {
+        rightSum += Double(collected[frame * channels + 1] * collected[frame * channels + 1])
+      }
+      if previous <= 0 && sample > 0 { crossings += 1 }
+      previous = sample
+    }
+    let windowFrames = Double(analysisEnd - analysisStart)
+    let rms = sqrt(sum / windowFrames)
+    let hz = Double(crossings) / (windowFrames / 48_000)
+    require(abs(rms - 0.25 / sqrt(2)) < 0.004, "\(rate) Hz sine gain preserved: \(rms)")
+    require(abs(hz - 997) < 2, "\(rate) Hz sine frequency preserved: \(hz)")
+    if channels > 1 {
+      require(
+        abs(sqrt(rightSum / windowFrames) - 0.125 / sqrt(2)) < 0.004,
+        "\(rate) Hz channel 1 keeps its own gain")
+    }
+  }
+  require(
+    InputRateConverter(deviceRate: 1_000, channelCount: 16) == nil, "Unsupported rate refused")
+  require(InputRateConverter(deviceRate: 48_000, channelCount: 0) == nil, "Zero channels refused")
+  print("PASS: 44.1/96/192/88.2/32 kHz input conversion with varied block sizes")
+}
+
 func writeRing(_ ring: FloatRingBuffer, _ samples: [Float], count: Int? = nil) -> Int {
   samples.withUnsafeBufferPointer { ring.write($0.baseAddress!, count: count ?? samples.count) }
 }
@@ -474,6 +630,8 @@ func checkRing() {
 }
 
 checkMatrixAndMapping()
+checkSurroundContentLayouts()
+checkInputRateConversion()
 checkGainClippingAndSanitization()
 checkLowpassAndHistory()
 checkRing()

@@ -4,7 +4,7 @@ Source: `future.md`. This is the active checklist; that file also contains histo
 
 ## Scope
 
-- Keep native, local-only 9.1.6 → stereo rendering, the ADC2 matrix, 48 kHz input/output, macOS 15 support, ad-hoc signing and the BlackHole workflow.
+- Keep native, local-only 9.1.6 → stereo rendering, the ADC2 matrix, a 48 kHz internal DSP, macOS 15 support, ad-hoc signing and the BlackHole workflow. Follow the input device's rate (converted internally) instead of requiring 48 kHz.
 - Prioritize audio safety, reliable controls and measured efficiency. Never change system routing/settings or silently select another output.
 - No new accessibility features or accessibility-specific release qualification, per owner request. Existing native behavior and AX hooks remain: the hooks also exercise ordinary controls in automated tests.
 - Do not redo completed engineering, redesign the UI or add effects without a demonstrated need.
@@ -16,7 +16,7 @@ Source: `future.md`. This is the active checklist; that file also contains histo
 - [x] Deliver control-path status synchronously; clear meters and surface errors; Stop cancels permission-pending starts.
 - [x] Restart active routes for changed devices/buffers; preserve missing saved identity; stop on disconnect without fallback; subscribe with removable device listeners.
 - [x] Check/request microphone permission for input; explain denied/restricted access; allow output-only keep-alive without input permission; honor launch preferences.
-- [x] Preallocate/bound callback scratch storage, safely silence invalid output, stop callbacks before releasing resources, and monitor route availability and 48 kHz formats during rendering/keep-alive.
+- [x] Preallocate/bound callback scratch storage, safely silence invalid output, stop callbacks before releasing resources, and monitor route availability and live client formats during rendering/keep-alive.
 - [x] Preserve filter/delay history on gain/swap edits; reset topology changes only; sanitize non-finite samples/gain and keep ring overflow/underflow stereo-frame aligned.
 - [x] Decode missing settings with defaults, normalize persisted values, save atomically, report errors, debounce writes without delaying DSP updates, and flush on quit.
 - [x] Add deterministic regressions for every bed channel/matrix weight/mapping, gain/swap, both clipping polarities, filter continuity, silence/invalid input, concurrent ring boundaries and preference migration; fail lint/build/check errors.
@@ -35,7 +35,7 @@ Source: `future.md`. This is the active checklist; that file also contains histo
 
 ### Phase 3 — usability and release hardening
 
-- [x] Provide truthful setup checks for channel count, both sample rates, permission and safe stereo output; keep mapping/system playback routing explicitly manual.
+- [x] Provide truthful setup checks for channel count, device formats/rates (with conversion text), permission and safe stereo output; keep mapping/system playback routing explicitly manual.
 - [x] Provide saved-route-only Retry in window/menu/global Transport command; refresh once; no automatic reconnect start/fallback; repeated commands do not interrupt an unchanged route.
 - [x] Test delayed-worker queue ownership, cancellation, stale events, warmup, configuration, teardown lifetime and reentrancy with isolated dependencies.
 - [x] Exercise actual product views/native control actions with fake audio/preferences; retain stable identifiers and existing AX/reduced-motion hooks without expanding accessibility scope.
@@ -54,6 +54,15 @@ Source: `future.md`. This is the active checklist; that file also contains histo
 - [x] Disable Retry during every starting state; reorder favorites using applicable visible neighbors and correct boundary availability.
 - [x] Execute the real suite with relaunch `--test` from any working directory; check/build before terminating a running app.
 - [x] Test actual AudioEngine through isolated HAL shadows and native meter logic in debug/optimized modes; reject failed release gates, whitespace, stale/wrong/thin/unsigned archives.
+
+### Device-rate and logging follow-through (1.4.0, build 6)
+
+- [x] Stop requiring 48 kHz. The input follows the device rate and `InputRateConverter` converts to 48 kHz; the output keeps a 48 kHz client format.
+- [x] Reopen only the input unit on a live rate/width change; keep the output and queue running; ignore the stale format-change render error after the reopen; refuse only <2 channels or rates outside 8–768 kHz.
+- [x] Accept narrower inputs (bed slots beyond the device width stay silent) instead of blocking Start.
+- [x] Report the live input format in status/checklist and watch selected devices for rate/width changes.
+- [x] Add a rotating local diagnostic log (failures with counters, sessions, rate changes, heartbeat, fatal-signal markers, unclean-exit detection) with menu/Advanced/Settings access.
+- [x] Cover rate/width reopen, content layouts (stereo/5.1/7.1/9.1/9.1.6), converter quality and log behavior in the automated suites; verify real BlackHole → engine → loopback audio at 44.1/48/96 kHz.
 
 ## Feasible follow-through in this session
 
@@ -92,9 +101,11 @@ export SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk
 - [ ] Rapid Start/Stop from main, Settings and menu bar; Stop while a real permission dialog is open.
 - [ ] Change input/output/buffer while rendering; repeatedly adjust gain/swap and listen for preserved LFE/dry continuity.
 - [ ] Unplug input/output during rendering and keep-alive; reconnect and verify saved-route-only manual Retry, no implicit start/fallback.
-- [ ] Change device sample rates, sleep/wake, reconnect USB/Bluetooth and test hardware refusing the requested buffer size.
+- [ ] Change device sample rates, sleep/wake, reconnect USB/Bluetooth and test hardware refusing the requested buffer size. (Rate switching through the real engine is now hardware-verified; sleep/wake, USB/Bluetooth and buffer refusal remain.)
+- [ ] Listen through a rate switch on the physical output and decide whether the ~0.25 s re-prime gap needs smoothing (crossfade/hold-last) or is acceptable at track boundaries.
+- [ ] Confirm the diagnostic log on a real abrupt stop (forced quit, power loss) and after rotation on a long-running session.
 - [ ] Confirm unsafe aggregate/BlackHole feedback routes are rejected on real devices.
-- [ ] Play all bed channels at known levels; verify speaker mapping, system playback routing, silence, loud LFE, gain/swap and clipping safely.
+- [ ] Play all bed channels at known levels; verify speaker mapping, system playback routing, silence, loud LFE, gain/swap and clipping safely. (Matrix sums for stereo/5.1/7.1/9.1/9.1.6 at 44.1/48/96 kHz were hardware-verified through a captured loopback; speaker mapping and physical listening remain.)
 - [ ] Listen for resampler artifacts and run multiple-hour playback on the devices actually used; record glitches and final counters. Offline virtual hours do not complete this item.
 - [ ] Quit immediately after a settings edit, relaunch and verify real-file persistence; exercise save-error recovery if safely reproducible.
 - [ ] Verify actual main/Settings/MenuBarExtra scenes and ordinary global commands: Cmd-Shift-Space, Cmd-Shift-R, Cmd-comma, setup dismissal and reopening a closed main window. This is functional dispatch testing, not a full accessibility audit.

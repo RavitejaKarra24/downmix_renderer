@@ -345,6 +345,16 @@ struct ContentView: View {
 
           Divider()
           EngineDiagnosticsView()
+
+          Button {
+            DiagnosticLogActions.reveal()
+          } label: {
+            Label("Show diagnostic log", systemImage: "doc.text.magnifyingglass")
+          }
+          .buttonStyle(SecondaryButtonStyle())
+          .help("Opens ~/Library/Logs/Downmix/downmix.log")
+          .accessibilityIdentifier("main.showLog")
+          .accessibilityHint("Opens the failure and lifecycle log in Finder")
         }
         .padding(12)
         .downmixRecessedWell(cornerRadius: 12)
@@ -403,6 +413,12 @@ struct ContentView: View {
       Text(text)
         .font(DownmixTheme.TypeScale.body)
       Spacer()
+      Button("Log") {
+        DiagnosticLogActions.reveal()
+      }
+      .accessibilityIdentifier("main.showLogError")
+      .accessibilityLabel("Show diagnostic log")
+      .accessibilityHint("Opens the log containing this failure's counters")
       Button("Retry") {
         state.retrySavedRoute()
       }

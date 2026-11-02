@@ -25,7 +25,6 @@ final class StubHAL: @unchecked Sendable {
     var client = AudioStreamBasicDescription()
     var callback = AURenderCallbackStruct()
     var isInput = false
-    var hardwareRate = 48_000.0
     var started = false
   }
   var devices: [AudioDeviceID: Device] = [:]
@@ -42,6 +41,9 @@ final class StubHAL: @unchecked Sendable {
   var stopProbe: (() -> Void)?
   var disposalCount = 0
   var nextUnit = 1
+  /// Per-channel sample value returned by input renders, mirroring what a player
+  /// writes into BlackHole. `nil` renders silence.
+  var inputValues: [Float]?
   let renderHook = Mutex<(@Sendable () -> Void)?>(nil)
 
   func reset() {
@@ -59,7 +61,16 @@ final class StubHAL: @unchecked Sendable {
     layoutSettable = true
     layoutWriteFailures = 0
     layoutWrites = 0
+    inputValues = nil
     renderHook.withLock { $0 = nil }
+  }
+
+  func inputCallback(frames: UInt32) -> OSStatus {
+    let unit = units.values.first { $0.isInput }!
+    var flags: AudioUnitRenderActionFlags = []
+    var timestamp = AudioTimeStamp()
+    return unit.callback.inputProc!(
+      unit.callback.inputProcRefCon!, &flags, &timestamp, 1, frames, nil)
   }
 
   func outputCallback(nilData: Bool = true) -> OSStatus {
@@ -154,8 +165,9 @@ func AudioUnitGetProperty(
       (state.isInput && scope == kAudioUnitScope_Output)
       || (!state.isInput && scope == kAudioUnitScope_Input)
     if !client {
-      format.mSampleRate = state.hardwareRate
+      // AUHAL's device side always tracks the live device, including live rate changes.
       let device = stubHAL.devices[state.device]!
+      format.mSampleRate = device.rate
       format.mChannelsPerFrame = UInt32(
         state.isInput ? device.inputChannels : device.outputChannels)
     }
@@ -173,8 +185,27 @@ func AudioUnitRender(
 ) -> OSStatus {
   let hook = stubHAL.renderHook.withLock { $0 }
   hook?()
+  let unit = stubHAL.units[unit]!
+  let device = stubHAL.devices[unit.device]!
+  if unit.isInput {
+    // Measured AUHAL behaviour: a virtual input cannot convert rates, so a client
+    // format whose rate differs from the live device fails every render.
+    guard unit.client.mSampleRate == device.rate else {
+      return kAudioUnitErr_CannotDoInCurrentContext
+    }
+  }
   for buffer in UnsafeMutableAudioBufferListPointer(data) {
-    if let pointer = buffer.mData { memset(pointer, 0, Int(buffer.mDataByteSize)) }
+    guard let pointer = buffer.mData else { continue }
+    let samples = pointer.assumingMemoryBound(to: Float.self)
+    let count = Int(buffer.mDataByteSize) / MemoryLayout<Float>.size
+    let channels = max(1, Int(buffer.mNumberChannels))
+    if unit.isInput, let values = stubHAL.inputValues, !values.isEmpty {
+      for index in 0..<count {
+        samples[index] = values[min(values.count - 1, index % channels)]
+      }
+    } else {
+      memset(pointer, 0, Int(buffer.mDataByteSize))
+    }
   }
   return noErr
 }

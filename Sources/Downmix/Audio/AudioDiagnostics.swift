@@ -93,6 +93,13 @@ final class AudioDiagnostics: Sendable {
     pendingFailure.exchange(0, ordering: .acquiringAndReleasing)
   }
 
+  /// A successful input reopen with the live device format makes the specific
+  /// format-change render error stale. Other failures still stop the run.
+  func clearStaleFormatFailure(_ error: Int32) {
+    _ = pendingFailure.compareExchange(
+      expected: error, desired: 0, ordering: .acquiringAndReleasing)
+  }
+
   func snapshot(requested: Int, input: Int, output: Int) -> EngineDiagnostics {
     EngineDiagnostics(
       underrunCount: underruns.load(ordering: .relaxed),
