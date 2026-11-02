@@ -25,6 +25,16 @@ if [[ ${#ARCH_LIST[@]} -eq 0 ]]; then
   ARCH_LIST=("$HOST_ARCH")
 fi
 
+# CLT's default SDK27 can lack the SwiftUI State macro plugin, which breaks every
+# @State declaration. Use the stable SDK, matching the check scripts.
+if [[ -z "${SDKROOT:-}" ]]; then
+  if [[ -d /Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk ]]; then
+    export SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk
+  else
+    export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+  fi
+fi
+
 SOURCE_DIGEST="$("$ROOT/Scripts/source_digest.sh")"
 
 # Keep architecture products separate and ask SwiftPM for their actual location.
