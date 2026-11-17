@@ -72,7 +72,7 @@ enum DeviceManager {
       .trimmingCharacters(in: .whitespacesAndNewlines)
   }
 
-  private static func deviceID(uid: String) -> AudioDeviceID? {
+  static func deviceID(uid: String) -> AudioDeviceID? {
     // UID translation avoids enumerating the full device list for every safety
     // certificate and every watchdog tick. The qualifier is a CFString pointer.
     var address = AudioObjectPropertyAddress(
@@ -132,6 +132,10 @@ enum DeviceManager {
       outputChannelCount: outputs,
       nominalSampleRate: rate
     )
+  }
+
+  static func uid(id: AudioDeviceID) -> String? {
+    stringProperty(id: id, selector: kAudioDevicePropertyDeviceUID)
   }
 
   struct RouteNode {
@@ -348,6 +352,55 @@ enum DeviceManager {
   static func applyOutputFormat(
     deviceID: AudioDeviceID, rate: Double, preferredBits: Int?
   ) -> PhysicalFormat? {
+    applyOutputFormat(deviceID: deviceID) { available, channels in
+      physicalFormat(in: available, rate: rate, channels: channels, preferredBits: preferredBits)
+    }
+  }
+
+  /// Puts the output back to `original`'s depth and sample kind at its current rate: the
+  /// DAC is shared, and the next app (e.g. Sfera, which plays float) should find it as
+  /// it was rather than at a source's 16-bit depth. Exact match first, else nearest deeper.
+  @discardableResult
+  static func restoreOutputFormat(deviceID: AudioDeviceID, to original: PhysicalFormat)
+    -> PhysicalFormat?
+  {
+    let rate = sampleRate(id: deviceID)
+    return applyOutputFormat(deviceID: deviceID) { available, channels in
+      let exact = available.map(\.mFormat).first { format in
+        let candidate = PhysicalFormat(format)
+        return format.mFormatID == kAudioFormatLinearPCM && format.mChannelsPerFrame == channels
+          && candidate.bits == original.bits && candidate.isFloat == original.isFloat
+          && (format.mSampleRate == 0 || abs(format.mSampleRate - rate) <= 0.5)
+      }
+      if var exact {
+        if exact.mSampleRate == 0 { exact.mSampleRate = rate }
+        return exact
+      }
+      return physicalFormat(
+        in: available, rate: rate, channels: channels, preferredBits: original.bits)
+    }
+  }
+
+  /// The first output stream's current physical format.
+  static func currentOutputFormat(deviceID: AudioDeviceID) -> PhysicalFormat? {
+    var property = AudioObjectPropertyAddress(
+      mSelector: kAudioDevicePropertyStreams,
+      mScope: kAudioDevicePropertyScopeOutput,
+      mElement: kAudioObjectPropertyElementMain
+    )
+    var stream = AudioStreamID(0)
+    var size = UInt32(MemoryLayout<AudioStreamID>.size)
+    // Asking for one ID returns the first stream even when the device has several.
+    guard AudioObjectGetPropertyData(deviceID, &property, 0, nil, &size, &stream) == noErr,
+      size == MemoryLayout<AudioStreamID>.size, let format = physicalFormat(stream: stream)
+    else { return nil }
+    return PhysicalFormat(format)
+  }
+
+  private static func applyOutputFormat(
+    deviceID: AudioDeviceID,
+    choose: ([AudioStreamRangedDescription], UInt32) -> AudioStreamBasicDescription?
+  ) -> PhysicalFormat? {
     var property = AudioObjectPropertyAddress(
       mSelector: kAudioDevicePropertyStreams,
       mScope: kAudioDevicePropertyScopeOutput,
@@ -364,9 +417,7 @@ enum DeviceManager {
     var result: PhysicalFormat?
     for stream in streams.prefix(Int(size) / MemoryLayout<AudioStreamID>.size) {
       guard var current = physicalFormat(stream: stream) else { continue }
-      if let chosen = physicalFormat(
-        in: availablePhysicalFormats(stream: stream), rate: rate,
-        channels: current.mChannelsPerFrame, preferredBits: preferredBits),
+      if let chosen = choose(availablePhysicalFormats(stream: stream), current.mChannelsPerFrame),
         PhysicalFormat(chosen).bits != PhysicalFormat(current).bits
           || PhysicalFormat(chosen).isFloat != PhysicalFormat(current).isFloat
       {

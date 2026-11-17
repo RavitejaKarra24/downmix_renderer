@@ -80,6 +80,8 @@ final class AudioEngine: @unchecked Sendable {
   private var outputPhysicalFormat: DeviceManager.PhysicalFormat?
   /// Source bit depth to match at the DAC, when known; `nil` selects the deepest.
   private var preferredOutputBits: Int?
+  /// The DAC's own format before this run first changed it; put back when the run ends.
+  private var originalOutputFormat: (device: AudioDeviceID, format: DeviceManager.PhysicalFormat)?
   private var inputRateConverter: InputRateConverter?
   private var convertedInput = [Float]()
   private var maximumConvertedFrames = 0
@@ -733,6 +735,11 @@ final class AudioEngine: @unchecked Sendable {
   private func applyOutputPhysicalFormat(rate: Double) {
     let deviceID = expectedOutputDeviceID
     guard deviceID != kAudioObjectUnknown else { return }
+    if originalOutputFormat == nil,
+      let original = DeviceManager.currentOutputFormat(deviceID: deviceID)
+    {
+      originalOutputFormat = (deviceID, original)
+    }
     let before = outputPhysicalFormat
     outputPhysicalFormat = DeviceManager.applyOutputFormat(
       deviceID: deviceID, rate: rate, preferredBits: preferredOutputBits)
@@ -997,6 +1004,16 @@ final class AudioEngine: @unchecked Sendable {
     lastOutputRateNotice = nil
     outputPhysicalFormat = nil
     preferredOutputBits = nil
+    if let original = originalOutputFormat {
+      originalOutputFormat = nil
+      if let restored = DeviceManager.restoreOutputFormat(
+        deviceID: original.device, to: original.format),
+        restored.bits != original.format.bits || restored.isFloat != original.format.isFloat
+      {
+        logger.notice(
+          "Output format left at \(restored.label); \(original.format.label) unavailable")
+      }
+    }
 
     if inUnit != nil || outUnit != nil {
       logger.info("Audio units stopped and disposed")

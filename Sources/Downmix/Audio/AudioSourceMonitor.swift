@@ -13,6 +13,9 @@ struct AudioPlaybackSource: Identifiable, Equatable, Sendable {
 struct AudioSourceObservation: Equatable, Sendable {
   var sources: [AudioPlaybackSource] = []
   var isAvailable: Bool = true
+  /// Other apps reading the input device (another renderer such as Sfera). They are not
+  /// playback sources: while one runs, the listener hears both renderers at once.
+  var renderers: [AudioPlaybackSource] = []
 }
 
 /// Call start/stop on the main thread; reports arrive on the main queue.
@@ -113,11 +116,20 @@ final class AudioSourceMonitor: AudioSourceMonitoring, Sendable {
 
     var observation = AudioSourceObservation()
     var sourcesByPID: [Int32: AudioPlaybackSource] = [:]
+    var renderersByPID: [Int32: AudioPlaybackSource] = [:]
     for process in Set(processes).sorted() {
       // PID is a pid_t (Int32); reading its bits uses the same four-byte HAL ABI.
       let pid = Self.readUInt32(object: process, selector: kAudioProcessPropertyPID)
         .map { Int32(bitPattern: $0) }
       if pid == ownPID { continue }
+      // A renderer reads the input (its private aggregate also writes to it), so it is
+      // reported apart from the players and never claims a source rate.
+      if let pid, pid > 0, Self.isCapturing(process: process, deviceID: inputDeviceID) {
+        if renderersByPID[pid] == nil {
+          renderersByPID[pid] = Self.describe(process: process, pid: pid)
+        }
+        continue
+      }
       let running = Self.readUInt32(
         object: process, selector: kAudioProcessPropertyIsRunningOutput)
       if running == 0 { continue }
@@ -133,21 +145,60 @@ final class AudioSourceMonitor: AudioSourceMonitoring, Sendable {
         observation.isAvailable = false
         continue
       }
-      let app = NSRunningApplication(processIdentifier: pid)
-      let bundleID =
-        Self.readBundleIdentifier(process: process) ?? Self.nonempty(app?.bundleIdentifier)
-      let name = Self.nonempty(app?.localizedName) ?? Self.processName(pid: pid)
       // Missing display metadata is harmless: the PID still identifies the client.
       if sourcesByPID[pid] == nil {
-        sourcesByPID[pid] = AudioPlaybackSource(
-          id: pid, name: name ?? bundleID ?? "Process \(pid)", bundleIdentifier: bundleID)
+        sourcesByPID[pid] = Self.describe(process: process, pid: pid)
       }
     }
-    observation.sources = sourcesByPID.values.sorted {
+    let byName: (AudioPlaybackSource, AudioPlaybackSource) -> Bool = {
       let order = $0.name.localizedCaseInsensitiveCompare($1.name)
       return order == .orderedSame ? $0.id < $1.id : order == .orderedAscending
     }
+    observation.sources = sourcesByPID.values.sorted(by: byName)
+    observation.renderers = renderersByPID.values.sorted(by: byName)
     return observation
+  }
+
+  /// Other processes currently reading `deviceID`: running input IO on it directly or
+  /// through an aggregate that contains it. Synchronous HAL reads; nil when unreadable.
+  static func renderers(of deviceID: AudioDeviceID) -> [AudioPlaybackSource]? {
+    guard deviceID != kAudioObjectUnknown,
+      let processes = readObjects(
+        object: AudioObjectID(kAudioObjectSystemObject),
+        selector: kAudioHardwarePropertyProcessObjectList)
+    else { return nil }
+    let ownPID = ProcessInfo.processInfo.processIdentifier
+    var result: [Int32: AudioPlaybackSource] = [:]
+    for process in processes {
+      guard
+        let pid = readUInt32(object: process, selector: kAudioProcessPropertyPID)
+          .map({ Int32(bitPattern: $0) }), pid > 0, pid != ownPID,
+        isCapturing(process: process, deviceID: deviceID)
+      else { continue }
+      result[pid] = describe(process: process, pid: pid)
+    }
+    return result.values.sorted { $0.id < $1.id }
+  }
+
+  private static func isCapturing(process: AudioObjectID, deviceID: AudioDeviceID) -> Bool {
+    guard readUInt32(object: process, selector: kAudioProcessPropertyIsRunningInput) == 1,
+      let devices = readObjects(
+        object: process, selector: kAudioProcessPropertyDevices,
+        scope: kAudioObjectPropertyScopeInput)
+    else { return false }
+    return devices.contains { device in
+      device == deviceID
+        || (readObjects(object: device, selector: kAudioAggregateDevicePropertyActiveSubDeviceList)
+          ?? []).contains(deviceID)
+    }
+  }
+
+  private static func describe(process: AudioObjectID, pid: Int32) -> AudioPlaybackSource {
+    let app = NSRunningApplication(processIdentifier: pid)
+    let bundleID = readBundleIdentifier(process: process) ?? nonempty(app?.bundleIdentifier)
+    let name = nonempty(app?.localizedName) ?? processName(pid: pid)
+    return AudioPlaybackSource(
+      id: pid, name: name ?? bundleID ?? "Process \(pid)", bundleIdentifier: bundleID)
   }
 
   private static func address(

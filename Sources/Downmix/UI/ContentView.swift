@@ -257,10 +257,24 @@ struct ContentView: View {
     @Bindable var state = state
 
     return VStack(alignment: .leading, spacing: 12) {
-      Text("DSP OPTIONS")
+      Text("OPTIONS")
         .font(DownmixTheme.TypeScale.label)
         .tracking(0.7)
         .foregroundStyle(DownmixTheme.textSecondary)
+
+      Toggle(isOn: $state.preferences.routeSystemOutput) {
+        optionLabel(
+          title: "Route Mac sound through Downmix",
+          detail: "Sets Mac output to the input while running; restores it on Stop",
+          symbol: "point.3.connected.trianglepath.dotted"
+        )
+      }
+      .toggleStyle(.switch)
+      .onChange(of: state.preferences.routeSystemOutput) { _, _ in
+        state.systemOutputRoutingChanged()
+      }
+      .accessibilityLabel("Route Mac sound through Downmix")
+      .accessibilityIdentifier("main.routeSystemOutput")
 
       Toggle(isOn: $state.preferences.lfeLowpass) {
         optionLabel(

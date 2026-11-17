@@ -299,6 +299,25 @@ private struct GeneralSettingsPane: View {
         }
       }
 
+      Section("Routing") {
+        Toggle(isOn: $state.preferences.routeSystemOutput) {
+          VStack(alignment: .leading, spacing: 2) {
+            Text("Route Mac sound through Downmix")
+            Text(
+              "While rendering, Mac sound output is set to the input so Music sends Dolby Atmos as the full bed. Stop or quit restores your previous output."
+            )
+            .font(.caption)
+            .foregroundStyle(.secondary)
+          }
+        }
+        .toggleStyle(.switch)
+        .accessibilityLabel("Route Mac sound through Downmix")
+        .accessibilityIdentifier("settings.routeSystemOutput")
+        .onChange(of: state.preferences.routeSystemOutput) { _, _ in
+          state.systemOutputRoutingChanged()
+        }
+      }
+
       Section("Renderer") {
         LabeledContent("Status") {
           Label(state.status.message, systemImage: rendererStatusSymbol)

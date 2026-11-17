@@ -6,6 +6,7 @@ struct DownmixApp: App {
   @State private var appState: AppState
 
   init() {
+    Self.yieldToRunningInstance()
     let info = Bundle.main.infoDictionary
     let version = info?["CFBundleShortVersionString"] as? String ?? "development"
     let build = info?["CFBundleVersion"] as? String ?? "-"
@@ -15,9 +16,24 @@ struct DownmixApp: App {
     let state = AppState(
       musicRateMonitor: MusicTrackRateMonitor(), audioSourceMonitor: AudioSourceMonitor(),
       decoderRateMonitorFactory: { DecoderRateMonitor() },
-      sourceFileMonitorFactory: { SourceFileMonitor() })
+      sourceFileMonitorFactory: { SourceFileMonitor() },
+      systemOutputRouter: SystemOutputRouter())
     state.logStartupSummary()
     _appState = State(initialValue: state)
+  }
+
+  /// Two copies (e.g. ~/Applications and a fresh build) would both open the same input and
+  /// DAC, double the audio, and fight over the Mac's sound output. Hand over to the copy
+  /// already running instead.
+  private static func yieldToRunningInstance() {
+    guard let bundleID = Bundle.main.bundleIdentifier else { return }
+    let me = ProcessInfo.processInfo.processIdentifier
+    guard
+      let other = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
+        .first(where: { $0.processIdentifier != me && !$0.isTerminated })
+    else { return }
+    other.activate()
+    exit(0)
   }
 
   var body: some Scene {

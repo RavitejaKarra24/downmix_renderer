@@ -115,6 +115,7 @@ final class Fixture {
     audioSourceMonitor: (any AudioSourceMonitoring)? = nil,
     decoderMonitors: FakeDecoderMonitors? = nil,
     fileMonitors: FakeSourceFileMonitors? = nil,
+    systemOutputRouter: (any SystemOutputRouting)? = nil,
     rateMatchDelay: Duration = .zero
   ) -> AppState {
     var factory: (@MainActor () -> any DecoderRateMonitoring)?
@@ -145,8 +146,37 @@ final class Fixture {
       musicRateMonitor: musicRateMonitor, audioSourceMonitor: audioSourceMonitor,
       decoderRateMonitorFactory: factory,
       sourceFileMonitorFactory: fileFactory,
+      systemOutputRouter: systemOutputRouter,
       rateMatchDelay: rateMatchDelay
     )
+  }
+}
+
+/// In-memory Mac default output; `refuse` simulates Core Audio rejecting a change.
+@MainActor
+final class FakeSystemOutputRouter: SystemOutputRouting {
+  var current: String?
+  var known: Set<String>
+  var refuse = false
+  var sets: [String] = []
+  var pendingRestore: SystemOutputRestore?
+  /// Other apps reading each device (e.g. Sfera on BlackHole).
+  var renderers: [String: [String]] = [:]
+
+  func otherRenderers(uid: String) -> [String] { renderers[uid] ?? [] }
+
+  init(current: String?, known: Set<String>) {
+    self.current = current
+    self.known = known
+  }
+
+  func defaultOutputUID() -> String? { current }
+
+  func setDefaultOutput(uid: String) -> Bool {
+    guard !refuse, known.contains(uid) else { return false }
+    sets.append(uid)
+    current = uid
+    return true
   }
 }
 
@@ -350,7 +380,166 @@ struct LifecycleChecks {
     try await universalRateChecks()
     try decoderRateChecks()
     try sourceFileChecks()
-    print("All AppState lifecycle checks passed (18 groups)")
+    try systemOutputChecks()
+    print("All AppState lifecycle checks passed (19 groups)")
+  }
+
+  @MainActor
+  static func systemOutputChecks() throws {
+    // BlackHole is both an input and an output device; players write to its output side.
+    let blackHole = AudioDeviceInfo(
+      id: 101, name: "BlackHole 16ch", uid: "input-1", inputChannelCount: 16,
+      outputChannelCount: 16, nominalSampleRate: 48_000)
+    func makeFixture() -> Fixture {
+      let fixture = Fixture()
+      fixture.catalog = [blackHole, Fixture.output, Fixture.secondOutput]
+      return fixture
+    }
+    func routeCheck(_ state: AppState) -> SetupCheck? {
+      state.setupChecklist.checks.first { $0.id == .systemOutput }
+    }
+    let known: Set<String> = ["input-1", "output-1", "output-2"]
+
+    // A. Start routes Mac output to the input; Stop restores the previous default.
+    var fixture = makeFixture()
+    var router = FakeSystemOutputRouter(current: "output-1", known: known)
+    var state = fixture.makeState(systemOutputRouter: router)
+    try require(
+      routeCheck(state)?.status == .manual,
+      "Before Start the checklist explains that Start will route Mac output")
+    state.start()
+    try require(
+      router.current == "input-1"
+        && router.pendingRestore
+          == SystemOutputRestore(previousUID: "output-1", routedUID: "input-1"),
+      "Start makes the input the Mac default output and records what to restore")
+    try require(
+      state.systemOutputUID == "input-1" && routeCheck(state)?.status == .verified,
+      "A routed Mac output is verified in the checklist")
+    state.stop()
+    try require(
+      router.current == "output-1" && router.pendingRestore == nil,
+      "Stop restores the previous Mac default output")
+
+    // B. A user's own change during the run is never overridden on Stop.
+    state.start()
+    router.current = "output-2"
+    state.stop()
+    try require(
+      router.current == "output-2" && router.pendingRestore == nil,
+      "Stop leaves an output the user picked while rendering")
+
+    // C. Routing off: Start leaves Mac output alone and the checklist flags the bypass.
+    fixture = makeFixture()
+    router = FakeSystemOutputRouter(current: "output-1", known: known)
+    var preferences = AppPreferences()
+    preferences.routeSystemOutput = false
+    state = fixture.makeState(preferences, systemOutputRouter: router)
+    state.start()
+    try require(
+      router.sets.isEmpty && router.current == "output-1",
+      "With routing off Downmix never changes the Mac output")
+    try require(
+      routeCheck(state)?.status == .needsAttention,
+      "A DAC as Mac output while rendering is flagged: players bypass Downmix")
+    // Turning routing on mid-run routes immediately; turning it off restores.
+    state.preferences.routeSystemOutput = true
+    state.systemOutputRoutingChanged()
+    try require(router.current == "input-1", "Enabling routing while running routes at once")
+    state.preferences.routeSystemOutput = false
+    state.systemOutputRoutingChanged()
+    try require(
+      router.current == "output-1" && router.pendingRestore == nil,
+      "Disabling routing while running restores the previous output")
+    state.stop()
+
+    // D. A run that fails restores the Mac output too.
+    fixture = makeFixture()
+    router = FakeSystemOutputRouter(current: "output-1", known: known)
+    state = fixture.makeState(systemOutputRouter: router)
+    state.start()
+    fixture.engine.emit(EngineStatus(phase: .error, message: "Device vanished"))
+    try require(router.current == "output-1", "A failed run restores the Mac output")
+
+    // E. A crash leaves a restore record; the next launch undoes it.
+    fixture = makeFixture()
+    router = FakeSystemOutputRouter(current: "input-1", known: known)
+    router.pendingRestore = SystemOutputRestore(previousUID: "output-2", routedUID: "input-1")
+    _ = fixture.makeState(systemOutputRouter: router)
+    try require(
+      router.current == "output-2" && router.pendingRestore == nil,
+      "Launch restores the output a crashed session left routed")
+
+    // F. Refused changes are reported, not recorded as routed.
+    fixture = makeFixture()
+    router = FakeSystemOutputRouter(current: "output-1", known: known)
+    router.refuse = true
+    state = fixture.makeState(systemOutputRouter: router)
+    state.start()
+    try require(
+      router.current == "output-1" && router.pendingRestore == nil
+        && routeCheck(state)?.status == .needsAttention,
+      "A refused route change leaves no restore record and stays flagged")
+    state.stop()
+
+    // G. Another renderer (Sfera) took over the input before Stop: it owns the route now,
+    // so Stop must not switch the Mac away and knock it down to stereo.
+    fixture = makeFixture()
+    router = FakeSystemOutputRouter(current: "output-1", known: known)
+    state = fixture.makeState(systemOutputRouter: router)
+    state.start()
+    router.renderers["input-1"] = ["Sfera"]
+    state.stop()
+    try require(
+      router.current == "input-1" && router.pendingRestore == nil,
+      "Stop leaves Mac output on the input while another renderer reads it")
+
+    // H. Mac output already on the input (left by a renderer that quit): Stop must not
+    // leave it on a silent loopback, so Downmix's own output is the fallback.
+    fixture = makeFixture()
+    router = FakeSystemOutputRouter(current: "input-1", known: known)
+    state = fixture.makeState(systemOutputRouter: router)
+    state.start()
+    let dac = try unwrap(
+      state.outputDevices.first { $0.id == state.selectedOutputID }?.uid, "Selected output")
+    try require(
+      router.sets.isEmpty
+        && router.pendingRestore == SystemOutputRestore(previousUID: dac, routedUID: "input-1"),
+      "An input that is already the Mac output gets Downmix's DAC as its restore target")
+    state.stop()
+    try require(router.current == dac, "Stop hands the Mac output to the DAC, not silence")
+
+    // I. ...unless another renderer is using it: then that renderer restores it.
+    fixture = makeFixture()
+    router = FakeSystemOutputRouter(current: "input-1", known: known)
+    router.renderers["input-1"] = ["Sfera"]
+    state = fixture.makeState(systemOutputRouter: router)
+    state.start()
+    try require(
+      router.pendingRestore == nil, "No restore target while another renderer owns the input")
+    state.stop()
+    try require(router.current == "input-1", "Stop leaves the other renderer's route alone")
+
+    // J. Two renderers at once are flagged while running, and never claim a source rate.
+    fixture = makeFixture()
+    let clients = FakeAudioSourceMonitor()
+    state = fixture.makeState(audioSourceMonitor: clients)
+    state.start()
+    let sfera = AudioPlaybackSource(id: 777, name: "Sfera", bundleIdentifier: "dev.sfera.renderer")
+    clients.emit(
+      AudioSourceObservation(sources: [FakeAudioSourceMonitor.music], renderers: [sfera]))
+    let conflict = state.setupChecklist.checks.first { $0.id == .otherRenderer }
+    try require(
+      conflict?.status == .needsAttention && conflict?.guidance.contains("Sfera") == true,
+      "Another app reading the input is flagged by name while Downmix runs")
+    clients.emit(AudioSourceObservation(sources: [FakeAudioSourceMonitor.music]))
+    try require(
+      !state.setupChecklist.checks.contains { $0.id == .otherRenderer },
+      "The warning clears once the other renderer stops")
+    state.stop()
+    print(
+      "PASS system output: route on Start, restore on Stop/error/launch, user changes kept, other renderers respected"
+    )
   }
 
   static let zen = AudioPlaybackSource(

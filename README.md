@@ -81,12 +81,29 @@ menu-bar meter stays, and clicking it brings back the controls.
 2. Set **Input** to **BlackHole 16ch**.
 3. Set **Output** to your headphones or speakers.
 4. Leave **Preamp** at **-9.5 dB** to start. Lower it if the sound distorts.
-5. Click **Start**. The meters begin moving when audio is playing.
-6. In **System Settings → Sound → Output**, choose **BlackHole 16ch** so your Mac sends its
-   audio through Downmix.
+5. Click **Start**. Downmix switches your Mac's sound output to **BlackHole 16ch** so every
+   app sends its audio through Downmix, and the meters begin moving when audio is playing.
 
-To stop, click **Stop** in Downmix and set your Sound output back to your headphones or
-speakers.
+To stop, click **Stop**. Downmix puts your Mac's sound output back to what it was (if you
+changed it yourself in the meantime, your choice is kept). If Downmix crashes or is
+force-quit, it restores the output the next time it opens.
+
+**Route Mac sound through Downmix** (on by default, in **Options** and **Settings →
+General**) controls this. Turn it off to route by hand in **System Settings → Sound →
+Output**. Without it, Apple Music plays straight to your headphones or DAC, so Dolby Atmos
+tracks fall back to stereo and Downmix hears nothing; the **Setup Checklist** flags this as
+*Playback routed to input → Needs attention*.
+
+Only one copy of Downmix runs at a time: opening a second copy brings the running one to
+the front.
+
+**Other BlackHole renderers (e.g. Sfera).** Use one at a time. If another app is reading
+BlackHole while Downmix runs, the Setup Checklist names it (*Only Downmix renders the
+input*), because you would hear both mixes. When Downmix stops while another renderer has
+taken over BlackHole, it leaves the Mac's output on BlackHole for that app instead of
+switching it back. If the output was already on BlackHole when you pressed Start and no
+other app is using it, Stop moves it to Downmix's output device so the Mac is never left on
+a silent BlackHole. Downmix also returns the DAC to its original bit depth when it stops.
 
 If your device list is long, use the filter box. You can pin the devices you use most from
 their right-click menu and drag them into the order you like.
@@ -121,10 +138,12 @@ different output automatically. Failure counters remain visible until a new run 
 Downmix accepts decoded PCM from **any app routed to its selected input**: Kew, Music,
 Spotify, browsers, YouTube Music and other local/streaming players.
 
-1. Select **BlackHole 16ch** as Mac Sound output, or as the player's own output device.
-2. Select BlackHole as Downmix input and your physical DAC/headphones as Downmix output.
-3. Start Downmix. Do not select BlackHole as Downmix output; that could create feedback.
-   Downmix never changes your default system output or an app's routing.
+1. Select BlackHole as Downmix input and your physical DAC/headphones as Downmix output.
+2. Start Downmix. With **Route Mac sound through Downmix** on, the Mac's default output
+   becomes BlackHole while rendering and is restored on Stop or quit. With it off, select
+   **BlackHole 16ch** as Mac Sound output, or as the player's own output device, yourself.
+3. Do not select BlackHole as Downmix output; that could create feedback. Downmix never
+   changes an individual app's own output choice.
 
 **Settings → Audio → Sample rate** provides three modes:
 

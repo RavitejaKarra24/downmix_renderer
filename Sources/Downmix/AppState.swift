@@ -87,7 +87,7 @@ private final class NotificationObservation {
 struct SetupCheck: Identifiable, Equatable {
   enum ID: String {
     case input, inputRate, outputRate, output, authorization, speakerMapping, systemOutput
-    case musicRate
+    case musicRate, otherRenderer
   }
 
   enum Status: String {
@@ -157,6 +157,9 @@ final class AppState {
   @ObservationIgnored private var notificationObservers: [NotificationObservation] = []
   @ObservationIgnored private let log: any DiagnosticLogging
   @ObservationIgnored private let musicRateMonitor: (any MusicRateMonitoring)?
+  @ObservationIgnored private let systemOutputRouter: (any SystemOutputRouting)?
+  /// The Mac's default output, refreshed with the device catalog and on route changes.
+  private(set) var systemOutputUID: String?
   @ObservationIgnored private let audioSourceMonitor: (any AudioSourceMonitoring)?
   @ObservationIgnored private let makeDecoderRateMonitor:
     (@MainActor () -> any DecoderRateMonitoring)?
@@ -216,6 +219,7 @@ final class AppState {
     audioSourceMonitor: (any AudioSourceMonitoring)? = nil,
     decoderRateMonitorFactory: (@MainActor () -> any DecoderRateMonitoring)? = nil,
     sourceFileMonitorFactory: (@MainActor () -> any SourceFileMonitoring)? = nil,
+    systemOutputRouter: (any SystemOutputRouting)? = nil,
     rateMatchDelay: Duration = .milliseconds(1500)
   ) {
     self.engine = engine
@@ -236,6 +240,7 @@ final class AppState {
     self.audioSourceMonitor = audioSourceMonitor
     self.makeDecoderRateMonitor = decoderRateMonitorFactory
     self.makeSourceFileMonitor = sourceFileMonitorFactory
+    self.systemOutputRouter = systemOutputRouter
     self.rateMatchDelay = rateMatchDelay
     engine.setStatusHandler { [weak self] update in
       // The UI bridge delivers logical intents synchronously and generation-filtered
@@ -249,6 +254,8 @@ final class AppState {
       self?.receiveFinalDiagnostics(final)
     }
     refreshDevices()
+    // A previous session that crashed or was force-quit may have left Mac sound on the input.
+    restoreSystemOutputIfNeeded(reason: "recovered from previous session")
     if installListeners { self.installListeners() }
   }
 
@@ -351,12 +358,8 @@ final class AppState {
         ),
         permissionCheck,
         speakerMappingCheck(isRunning ? status.bedLayoutInstalled : nil),
-        SetupCheck(
-          id: .systemOutput, title: "Playback routed to input", status: .manual,
-          guidance:
-            "For any player, browser, YouTube Music or Spotify: set Mac Sound output (or the app\'s own output) to the selected input, and choose your physical DAC as Downmix output. Downmix never changes the default route. Original file/stream rate may be unavailable."
-        ),
-      ],
+        systemOutputSetupCheck(input: input),
+      ] + otherRendererSetupCheck(input: input),
       canRequestPermission: authorization == .notDetermined
     )
   }
@@ -732,7 +735,20 @@ final class AppState {
 
   private func receiveAudioSources(_ observation: AudioSourceObservation) {
     guard audioSources != observation else { return }
+    let renderersChanged = audioSources.renderers != observation.renderers
+    var playersOnly = audioSources
+    playersOnly.renderers = observation.renderers
     audioSources = observation
+    if renderersChanged {
+      let names = observation.renderers.map(\.name).joined(separator: ", ")
+      log.log(
+        observation.renderers.isEmpty ? .info : .warning, "sources",
+        observation.renderers.isEmpty
+          ? "no other app is rendering the input"
+          : "also rendering the input: \(names) (both play to the output)")
+    }
+    // Another renderer appearing or leaving does not change what the players claim.
+    guard playersOnly != observation else { return }
     if preferences.sampleRateMode == .automatic {
       cancelRateMatch()
     }
@@ -948,6 +964,7 @@ final class AppState {
 
   func refreshDevices() {
     setupCheckRevision &+= 1
+    refreshSystemOutput()
     if let deviceCatalog {
       let snapshot = DeviceCatalogSnapshot.capture(
         inputUID: preferences.inputDeviceUID, catalog: deviceCatalog,
@@ -1300,6 +1317,14 @@ final class AppState {
       return
     }
     if update.phase != .starting { pendingKeepAlive = false }
+    let wasRunning = status.phase == .running
+    defer {
+      if status.phase == .running, !wasRunning {
+        routeSystemOutputIfNeeded()
+      } else if status.phase == .stopped || status.phase == .error {
+        restoreSystemOutputIfNeeded(reason: "renderer \(status.phase.rawValue)")
+      }
+    }
     if status.phase != update.phase || status.message != update.message {
       status.phase = update.phase
       status.message = update.message
@@ -1407,6 +1432,151 @@ final class AppState {
       + " underruns=\(diagnostics.underrunCount) overruns=\(diagnostics.overrunCount)"
       + " rejected=\(diagnostics.rejectedSliceCount) renderErrors=\(diagnostics.renderErrorCount)"
       + " queued=\(diagnostics.queuedFrames) ppm=\(diagnostics.correctionPPM)"
+  }
+
+  // MARK: Mac sound output routing
+
+  func systemOutputRoutingChanged() {
+    persist()
+    if preferences.routeSystemOutput {
+      if status.phase == .running { routeSystemOutputIfNeeded() }
+    } else {
+      restoreSystemOutputIfNeeded(reason: "routing turned off")
+    }
+  }
+
+  private func refreshSystemOutput() {
+    guard let systemOutputRouter else { return }
+    let uid = systemOutputRouter.defaultOutputUID()
+    if systemOutputUID != uid { systemOutputUID = uid }
+  }
+
+  /// Players render for whatever the default output is. Pointing it at the input while the
+  /// renderer runs lets Music deliver Dolby Atmos as the multichannel bed instead of
+  /// rendering stereo for the DAC and bypassing Downmix.
+  private func routeSystemOutputIfNeeded() {
+    guard preferences.routeSystemOutput, let systemOutputRouter,
+      let input = inputDevices.first(where: { $0.id == (activeInputID ?? selectedInputID) }),
+      input.outputChannelCount >= 2
+    else { return }
+    let current = systemOutputRouter.defaultOutputUID()
+    guard current != input.uid else {
+      // Already on the input (set by hand, or left there by another renderer that quit).
+      // Unless another renderer still owns it, Stop must not leave the Mac on a silent
+      // loopback: hand it to Downmix's own output then.
+      let output = outputDevices.first(where: { $0.id == (activeOutputID ?? selectedOutputID) })
+      if systemOutputRouter.pendingRestore == nil, let output,
+        systemOutputRouter.otherRenderers(uid: input.uid).isEmpty
+      {
+        systemOutputRouter.pendingRestore = SystemOutputRestore(
+          previousUID: output.uid, routedUID: input.uid)
+      }
+      refreshSystemOutput()
+      return
+    }
+    guard systemOutputRouter.setDefaultOutput(uid: input.uid) else {
+      log.log(.warning, "system-output", "could not set Mac sound output to \(input.name)")
+      refreshSystemOutput()
+      return
+    }
+    // Keep the original default across repeated routes (e.g. a restart within one run).
+    if systemOutputRouter.pendingRestore == nil, let current {
+      systemOutputRouter.pendingRestore = SystemOutputRestore(
+        previousUID: current, routedUID: input.uid)
+    }
+    log.log(
+      .info, "system-output",
+      "routed Mac sound output \(deviceName(uid: current)) -> \(input.name)")
+    refreshSystemOutput()
+  }
+
+  /// Undoes only Downmix's own change: if the user picked another output meanwhile, it stays.
+  private func restoreSystemOutputIfNeeded(reason: String) {
+    guard let systemOutputRouter, let restore = systemOutputRouter.pendingRestore else { return }
+    systemOutputRouter.pendingRestore = nil
+    defer { refreshSystemOutput() }
+    let current = systemOutputRouter.defaultOutputUID()
+    guard current == restore.routedUID else {
+      log.log(
+        .info, "system-output",
+        "left Mac sound output on \(deviceName(uid: current)) (changed outside Downmix); \(reason)")
+      return
+    }
+    // Another renderer (e.g. Sfera) took over the input: it owns the route and restores
+    // the Mac output itself. Switching away now would knock it down to stereo.
+    let others = systemOutputRouter.otherRenderers(uid: restore.routedUID)
+    guard others.isEmpty else {
+      log.log(
+        .info, "system-output",
+        "left Mac sound output on \(deviceName(uid: current)): \(others.joined(separator: ", ")) is rendering it; \(reason)"
+      )
+      return
+    }
+    if systemOutputRouter.setDefaultOutput(uid: restore.previousUID) {
+      log.log(
+        .info, "system-output",
+        "restored Mac sound output to \(deviceName(uid: restore.previousUID)); \(reason)")
+    } else {
+      log.log(
+        .warning, "system-output",
+        "could not restore Mac sound output to \(deviceName(uid: restore.previousUID)); \(reason)")
+    }
+  }
+
+  private func deviceName(uid: String?) -> String {
+    guard let uid else { return "none" }
+    return (outputDevices + inputDevices).first(where: { $0.uid == uid })?.name ?? uid
+  }
+
+  /// Shown only while another app reads the input during a run: both renderers then
+  /// play to the DAC and the listener hears them mixed.
+  private func otherRendererSetupCheck(input: AudioDeviceInfo?) -> [SetupCheck] {
+    let names = audioSources.renderers.map(\.name)
+    guard isRunning, let input, !names.isEmpty else { return [] }
+    let list = ListFormatter.localizedString(byJoining: names)
+    return [
+      SetupCheck(
+        id: .otherRenderer, title: "Only Downmix renders the input", status: .needsAttention,
+        guidance:
+          "\(list) is also reading \(input.name), so you hear both at once. Turn \(list) off (or quit it) while Downmix runs."
+      )
+    ]
+  }
+
+  private func systemOutputSetupCheck(input: AudioDeviceInfo?) -> SetupCheck {
+    let title = "Playback routed to input"
+    guard let input else {
+      return SetupCheck(
+        id: .systemOutput, title: title, status: .manual,
+        guidance: "Select an input. Players must send their audio to it for Downmix to hear it.")
+    }
+    guard systemOutputRouter != nil else {
+      return SetupCheck(
+        id: .systemOutput, title: title, status: .manual,
+        guidance:
+          "Set Mac Sound output (or the player's own output) to \(input.name), and choose your physical DAC as Downmix output."
+      )
+    }
+    if systemOutputUID == input.uid {
+      return SetupCheck(
+        id: .systemOutput, title: title, status: .verified,
+        guidance:
+          "Mac sound output is \(input.name), so Music and other players send Downmix the full multichannel bed."
+      )
+    }
+    let current = deviceName(uid: systemOutputUID)
+    if preferences.routeSystemOutput, !isRunning {
+      return SetupCheck(
+        id: .systemOutput, title: title, status: .manual,
+        guidance:
+          "Mac sound output is \(current). Start switches it to \(input.name); Stop restores \(current)."
+      )
+    }
+    return SetupCheck(
+      id: .systemOutput, title: title, status: .needsAttention,
+      guidance:
+        "Mac sound output is \(current), so players bypass Downmix and Music plays Dolby Atmos as stereo. Turn on \u{201C}Route Mac sound through Downmix\u{201D}, or choose \(input.name) in System Settings → Sound → Output (or as the player's own output)."
+    )
   }
 
   private func stopRenderer(preservingFailureDiagnostics: Bool = false) {

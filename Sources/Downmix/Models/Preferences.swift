@@ -56,6 +56,9 @@ struct AppPreferences: Codable, Equatable, Sendable {
   /// These are user statements, not heuristics, and rank below decoder evidence.
   var appRateProfiles: [String: Double] = [:]
   var outputBitDepthMode: OutputBitDepthMode = .matchSource
+  /// While rendering, make the input (BlackHole) the Mac's default output so players send
+  /// it the multichannel bed, then restore the previous default output on Stop or quit.
+  var routeSystemOutput: Bool = true
 
   static let selectableSampleRates: [Double] = [
     8000, 16000, 44100, 48000, 88200, 96000, 176400, 192000,
@@ -108,6 +111,7 @@ extension AppPreferences {
     case layoutPresetName, framesPerBuffer, preampDb, inputLatencyMs, outputLatencyMs
     case keepOutputAlive, lfeLowpass, swapOutputs, autoStart, matchMusicSampleRate
     case sampleRateMode, fixedSampleRate, appRateProfiles, outputBitDepthMode
+    case routeSystemOutput
   }
 
   init(from decoder: Decoder) throws {
@@ -152,6 +156,8 @@ extension AppPreferences {
     outputBitDepthMode =
       try container.decodeIfPresent(OutputBitDepthMode.self, forKey: .outputBitDepthMode)
       ?? outputBitDepthMode
+    routeSystemOutput =
+      try container.decodeIfPresent(Bool.self, forKey: .routeSystemOutput) ?? routeSystemOutput
     self = normalized()
   }
 
@@ -176,5 +182,6 @@ extension AppPreferences {
     try container.encode(preferences.fixedSampleRate, forKey: .fixedSampleRate)
     try container.encode(preferences.appRateProfiles, forKey: .appRateProfiles)
     try container.encode(preferences.outputBitDepthMode, forKey: .outputBitDepthMode)
+    try container.encode(preferences.routeSystemOutput, forKey: .routeSystemOutput)
   }
 }

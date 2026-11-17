@@ -11,12 +11,14 @@ final class AudioDeviceMonitor {
     kAudioDevicePropertyStreamConfiguration,
   ]
 
-  private var address = AudioObjectPropertyAddress(
-    mSelector: kAudioHardwarePropertyDevices,
-    mScope: kAudioObjectPropertyScopeGlobal,
-    mElement: kAudioObjectPropertyElementMain
-  )
-  private var listener: AudioObjectPropertyListenerBlock?
+  /// The device list, plus the Mac's default output (players follow it, so the setup
+  /// checklist must too).
+  private static let systemSelectors: [AudioObjectPropertySelector] = [
+    kAudioHardwarePropertyDevices,
+    kAudioHardwarePropertyDefaultOutputDevice,
+  ]
+  private var systemListeners:
+    [(selector: AudioObjectPropertySelector, block: AudioObjectPropertyListenerBlock)] = []
   private var watchedDevices: [AudioDeviceID] = []
   private var watchedListeners: [(device: AudioDeviceID, block: AudioObjectPropertyListenerBlock)] =
     []
@@ -24,14 +26,26 @@ final class AudioDeviceMonitor {
 
   init(onChange: @escaping @MainActor @Sendable () -> Void) {
     self.onChange = onChange
-    let block: AudioObjectPropertyListenerBlock = { [onChange] _, _ in
-      Task { @MainActor in onChange() }
+    for selector in Self.systemSelectors {
+      var address = Self.address(selector)
+      let block: AudioObjectPropertyListenerBlock = { [onChange] _, _ in
+        Task { @MainActor in onChange() }
+      }
+      if AudioObjectAddPropertyListenerBlock(
+        AudioObjectID(kAudioObjectSystemObject), &address, .main, block
+      ) == noErr {
+        systemListeners.append((selector, block))
+      }
     }
-    if AudioObjectAddPropertyListenerBlock(
-      AudioObjectID(kAudioObjectSystemObject), &address, .main, block
-    ) == noErr {
-      listener = block
-    }
+  }
+
+  private static func address(_ selector: AudioObjectPropertySelector)
+    -> AudioObjectPropertyAddress
+  {
+    AudioObjectPropertyAddress(
+      mSelector: selector,
+      mScope: kAudioObjectPropertyScopeGlobal,
+      mElement: kAudioObjectPropertyElementMain)
   }
 
   /// Main thread only. Re-registers listeners only when the selection changes, so a
@@ -74,10 +88,10 @@ final class AudioDeviceMonitor {
   }
 
   deinit {
-    if let listener {
+    for entry in systemListeners {
+      var address = Self.address(entry.selector)
       AudioObjectRemovePropertyListenerBlock(
-        AudioObjectID(kAudioObjectSystemObject), &address, .main, listener
-      )
+        AudioObjectID(kAudioObjectSystemObject), &address, .main, entry.block)
     }
     removeWatchedListeners()
   }
