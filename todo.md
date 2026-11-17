@@ -176,17 +176,13 @@ export SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk
 - [ ] Collect comparable Release CPU observations for visible, closed, stopped and keep-alive states with an explicit verified PID; record machine, app version, devices, buffers, interval/duration and warmup/workload.
 - [ ] With full Xcode/Instruments available, collect allocation/ARC/lock/I/O and callback scheduling/deadline traces after warmup and during deliberate reconfiguration. Preserve traces and versions; source inspection/TSAN do not establish realtime deadlines or zero allocations.
 
-### Hosted CI
-
-- [ ] Commit/push the reviewed local changes when authorized, run hosted CI on that exact commit, verify the preamp native action on macOS 15, and fix any remaining runner-specific failures. Do not count a local run or a rerun of the old commit as verification of these edits.
-- [ ] Obtain a completely passing hosted run, including universal packaging/rendered UI and all sanitizer gates (the existing failed run skipped sanitizer checks).
-
 ## Stopped / not required for this scope
 
 These are deliberate cancellations, not completed features and not blocking TODOs:
 
 - **Stopped:** new accessibility features and dedicated VoiceOver speech/focus/rotor/custom-action certification.
 - **Stopped:** full physical keyboard traversal/focus certification, accessibility contrast/text scaling checks and system Reduce Motion animation qualification. Ordinary existing shortcuts/controls still need functional validation above.
+- **Stopped:** hosted CI. The GitHub Actions workflow was removed on 2026-11-17; the same checks run locally (see `docs/profiling.md`).
 - **Not planned:** notarization, Sparkle/auto-update or remote release publishing; retain ad-hoc distribution.
 - **Not planned:** opt-in automatic reconnect/recovery; explicit Retry already serves the requested safe behavior.
 - **Not planned:** visual redesign, new effects, matrix/rate changes, automatic system routing or device fallback.

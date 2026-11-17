@@ -52,6 +52,6 @@ for file in "${SOURCES[@]}"; do
   [[ "$file" == "$CHECK_DIR/Sources/Downmix/DownmixApp.swift" ]] || PRODUCT+=("$file")
 done
 swiftc "${FLAGS[@]}" "${PRODUCT[@]}" "$CHECK_DIR/main.swift" -o "$APP/Contents/MacOS/DownmixUIChecks"
-# Direct execution keeps the fixture in-process and makes failures visible to CI.
+# Direct execution keeps the fixture in-process and makes failures visible to the caller.
 # A hung AppKit/WindowServer must fail, never masquerade as a passing UI check.
 perl -e 'alarm 120; exec @ARGV or die $!' "$APP/Contents/MacOS/DownmixUIChecks" "$MODE"

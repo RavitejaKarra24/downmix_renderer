@@ -127,43 +127,23 @@ CSV escaping, reject invalid arguments and exited PIDs, preserve existing files,
 and inject deterministic `ps` death/reuse/zombie cases. They create temporary
 fixtures and remove them on exit; they do not use the GUI or user audio.
 
-# Phase 3: CI checks
+# Phase 3: release checks (local)
 
-`.github/workflows/check.yml` runs on push, pull request, and manual dispatch:
+There is no hosted CI. Hosted macOS runs failed for reasons unrelated to the code
+(a stale committed archive, runner-only UI timing, account billing), so the
+workflow was removed and these checks run locally before pushing:
 
-- Stable `macos-15`, Xcode **26.2**, selected by `maxim-lobanov/setup-xcode`, not a
-  hardcoded `/Applications` path. The [runner inventory](https://github.com/actions/runner-images/blob/main/images/macos/macos-15-Readme.md#xcode)
-  lists 26.2 and its macOS 26.2 SDK. Image availability can change; selection fails
-  rather than silently falling back to a beta or old toolchain.
-- Checkout v4.2.2 and setup-xcode v1 are pinned to commits verified from their
-  repository tags; checkout does not persist credentials.
-- Toolchain logging and a Swift 6.2+ check, plus SDK import/typecheck for AppKit,
-  CoreAudio, and Synchronization to reject an incomplete SDK.
-- `Scripts/check_whitespace.sh BASE HEAD` checks committed PR/push changes, not an
-  empty worktree diff. Full history is fetched; initial pushes/manual dispatch inspect the
-  committed tree. Bash syntax checks cover shell scripts under `Scripts` and `Checks`.
-- Read-only `Scripts/verify_archive.sh` validates the committed download's signature,
-  universal architectures, version/build, bundle ID, minimum OS, permission description
-  and signed build-input digest against the current source tree.
-- `Scripts/package_zip.sh` supplies an actual universal packaging smoke test. It runs
-  `Scripts/check_release.sh`: formatting/build and deterministic source/archive regression
-  checks plus `Scripts/check_ui.sh --rendered` with isolated fake audio/preferences.
-  No real audio units, permissions or routing are touched by the fixtures. The generated
-  smoke-test archive stays in the runner checkout; it is not published.
-- `Scripts/check_realtime.sh --tsan`, `Scripts/check_audio_transport.sh --tsan` and
-  `Scripts/check_clock_drift.sh --tsan` execute mailbox/DSP, output/counter and offline
-  resampler/clock specs with Thread Sanitizer. `Scripts/check_hal.sh --tsan` also covers
-  actual-engine logic through isolated HAL API shadows, including teardown lifetime.
-  Missing specs fail instead of skipping.
-- Only `contents: read`; cancel superseded runs on the same branch; 20-minute job
-  timeout. No remote release/push, installation/launch of the real app, or secrets configuration.
+```sh
+Scripts/check.sh                        # whitespace, bash syntax, swift-format, DSP/model checks, build
+Scripts/check_release.sh                # check.sh plus rendered native UI (needs a desktop session)
+Scripts/verify_archive.sh               # committed Downmix.zip: signature, universal, metadata, SourceDigest
+Scripts/check_realtime.sh --tsan        # mailbox/DSP under Thread Sanitizer
+Scripts/check_audio_transport.sh --tsan # output/counter specs under Thread Sanitizer
+Scripts/check_clock_drift.sh --tsan     # offline resampler/clock specs under Thread Sanitizer
+Scripts/check_hal.sh --tsan             # actual-engine logic via isolated HAL shadows
+```
 
-Hosted CI validates the committed tree, not collaborators' uncommitted work.
-The first inspected run, [37887832105](https://github.com/RavitejaKarra24/downmix_renderer/actions/runs/37887832105),
-failed: Bash 3.2 empty flag arrays skipped transport/clock checks, missing `rg`
-bypassed HAL symbol isolation, and the native preamp fixture failed on its action
-acknowledgement. Sanitizer steps were skipped. Local fixes use nonempty compiler
-flags, fail-closed system `awk` isolation and actual preamp binding-change validation;
-`Checks/Release/test_check_scripts.sh` covers shell failures with isolated fake tools.
-A fully passing hosted execution of the reviewed changes remains pending in
-[`../todo.md`](../todo.md). Neither CI nor self-tests measure live app CPU.
+`Scripts/package_zip.sh` runs `Scripts/check_release.sh` before building, then verifies
+its own extracted archive. The fixtures use isolated fake audio/preferences and do not
+touch real audio units, permissions or routing. Missing sanitizer specs fail instead of
+skipping. Neither these checks nor self-tests measure live app CPU.

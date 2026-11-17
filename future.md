@@ -6,8 +6,8 @@ Use [`todo.md`](todo.md) for current completed, pending and stopped work. The
 implementation records below are historical evidence, not a fresh backlog.
 Per owner request, new accessibility features and accessibility-specific manual
 qualification are stopped; existing native behavior/test hooks are retained.
-Ordinary controls, shortcuts and audio safety remain in scope. A hosted CI run
-has now failed; see the active checklist for findings and local follow-through.
+Ordinary controls, shortcuts and audio safety remain in scope. Hosted CI was
+removed on 2026-11-17; release checks run locally (see `docs/profiling.md`).
 
 ## Goals and boundaries
 
@@ -20,7 +20,7 @@ This is a prioritized engineering plan, not a promise of a bug-free app. Automat
 **Engineering implemented; release qualification is not complete.** The completion audit
 found gaps despite the earlier passing suites; the follow-through below closes them and
 adds regressions. The remaining hardware/TCC, functional native-scene/shortcut,
-Instruments/CPU, quarantined-installation and passing hosted-CI gates cannot be
+Instruments/CPU and quarantined-installation gates cannot be
 replaced by source inspection or fake-device tests. Accessibility-specific
 qualification is no longer a release gate for the requested scope. Notarization, auto-update and opt-in automatic recovery remain outside
 this plan's scope.
@@ -29,7 +29,7 @@ this plan's scope.
 | --- | --- |
 | Phase 1, items 1–7 | Implemented; deterministic DSP, preferences, lifecycle, asynchronous control, actual-engine stub-HAL and native meter checks. |
 | Phase 2 | Implemented; bounded transport/drift, shared off-main HAL control/catalog queue, fresh failure counters, profiling tooling. Runtime traces and real playback/CPU measurements pending. |
-| Phase 3 | Implemented; setup/recovery, native actions/accessibility regressions, failure-gated universal packaging and source/archive CI checks. Functional native-scene dispatch and passing hosted CI pending; dedicated accessibility qualification stopped. |
+| Phase 3 | Implemented; setup/recovery, native actions/accessibility regressions, failure-gated universal packaging and local source/archive checks. Functional native-scene dispatch pending; hosted CI removed; dedicated accessibility qualification stopped. |
 
 Use `Scripts/check.sh` for deterministic checks/build, `Scripts/check_release.sh` for those
 plus rendered native UI, and `Scripts/package_zip.sh` for the gated universal download.
@@ -70,7 +70,7 @@ Acceptance: `Scripts/check.sh` passes; regressions cover all bed channels, cente
 - **Implemented:** explicit saved-route Retry in the window/menu bar (⌘⇧R). Retry refreshes once and requires saved UIDs; reconnect does not auto-start or silently choose a fallback. Repeated Start or selection of the active device does not unnecessarily interrupt rendering. Opt-in automatic recovery remains separate follow-up work.
 - **Implemented:** delayed-worker checks cover queue ownership, cancellation, stale events, warmup, configuration, teardown lifetime and reentrancy. Native hosting/rendered accessibility fixtures use actual product views and fake audio/preferences dependencies. See `docs/ui-validation.md` for exact coverage and limitations.
 - **Implemented:** stable control identifiers, named device actions and reduced-motion gates; Retry now belongs to the global Transport menu. **Pending:** ordinary global shortcut dispatch and actual Settings/MenuBarExtra scene validation. **Stopped by owner request:** dedicated physical keyboard/VoiceOver/contrast/reduced-motion qualification and new accessibility features. Existing behavior/hooks remain; no unrelated visual redesign.
-- **CI configuration added; passing hosted run pending (an initial run failed; see `todo.md`):** `.github/workflows/check.yml` pins actions and selects stable Xcode 26.2 on macOS, running strict formatting/build/regressions, sampler self-tests and Thread Sanitizer checks. Packaging already requires checks and verifies the extracted archive. Retain ad-hoc distribution; notarization and auto-update are separate product decisions.
+- **CI configuration added, later removed (2026-11-17):** the former `.github/workflows/check.yml` pinned actions and selects stable Xcode 26.2 on macOS, running strict formatting/build/regressions, sampler self-tests and Thread Sanitizer checks. Packaging already requires checks and verifies the extracted archive. Retain ad-hoc distribution; notarization and auto-update are separate product decisions.
 
 ## Manual release gate
 
@@ -568,6 +568,6 @@ Changes are not committed or pushed.
 1. Multi-hour hardware/audio-quality validation, TCC allow/deny/cancellation, sleep/wake, Bluetooth/USB reconnect, and quarantined installation on a fresh account.
 2. Functional native scene/global shortcut dispatch; native fixtures cannot certify real App scene integration. Dedicated physical keyboard/VoiceOver/contrast/reduced-motion qualification is stopped by owner request.
 3. Instruments allocation/lock/deadline traces and actual release CPU observations using `docs/profiling.md`. This machine selects Command Line Tools; `xcrun xctrace list templates` fails because full Xcode/Instruments is unavailable.
-4. A fully passing hosted CI execution on the reviewed changes. Run [37887832105](https://github.com/RavitejaKarra24/downmix_renderer/actions/runs/37887832105) failed with Bash 3.2 empty-array errors, a silently bypassed missing `rg` isolation check, and a native preamp action-acknowledgement failure. Local follow-through and pending hosted confirmation are tracked in `todo.md`.
+4. ~~A fully passing hosted CI execution.~~ Hosted CI was removed on 2026-11-17; the same checks run locally (see `docs/profiling.md`).
 
 The engineering changes do not claim zero runtime allocations, hard-real-time guarantees, arbitrary-clock-jump tolerance, or hardware-qualified all-day playback.

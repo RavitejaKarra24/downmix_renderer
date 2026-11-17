@@ -401,7 +401,6 @@ on another machine or a fresh user account.
 | `Checks/ClockDrift/`, `Checks/AsyncControl/`, `Checks/UI/` | Offline clocks, delayed control/catalog, native hosted/rendered UI checks |
 | `Checks/HAL/`, `Checks/Metering/`, `Checks/Release/` | Isolated actual-engine safety/lifetime, native meter/timer and failure-gated archive regressions |
 | `docs/profiling.md`, `docs/ui-validation.md` | Runtime profiling and automated/manual UI qualification |
-| `.github/workflows/check.yml` | Stable macOS lint/build/regression/sanitizer CI |
 | `todo.md` | Active checklist: completed engineering, remaining qualification and stopped scope |
 | `future.md` | Original engineering plan and historical implementation/verification record |
 | `Scripts/` | Build, package, icon, and check scripts |
@@ -426,12 +425,13 @@ and produces an app that silently fails to launch — then unpacks its own outpu
 directory and re-verifies there. Packaging requires the rendered native UI gate and a logged-in
 macOS desktop session. The extracted app must match the expected version/build, bundle ID,
 minimum OS, microphone permission text and both architectures. A signed `SourceDigest` records
-current Swift/build inputs (including uncommitted files); stale downloads fail local/CI
-verification. This is a stale-artifact guard, not independent build provenance or hardware qualification.
+current Swift/build inputs (including uncommitted files); stale downloads fail
+`Scripts/verify_archive.sh`. This is a stale-artifact guard, not independent build provenance or hardware qualification.
 
 When making a user-facing change: bump `MARKETING_VERSION` in `version.env`, run
-`Scripts/package_zip.sh`, and commit the regenerated `Downmix.zip` in the same commit. Git
-will not warn you about a stale artifact. If the app ever outgrows ~10 MB, move the zip to
+`Scripts/package_zip.sh`, and commit the regenerated `Downmix.zip` in the same commit. There
+is no hosted CI; run `Scripts/check.sh` (or `Scripts/check_release.sh`) and
+`Scripts/verify_archive.sh` locally before pushing, since nothing else will catch a stale artifact. If the app ever outgrows ~10 MB, move the zip to
 GitHub Releases instead of committing it.
 
 ## DSP notes
